@@ -12,6 +12,7 @@ import {
   NodejsLambda,
   download,
   glob,
+  hydrateFilesMap,
   isExternalSymlinkTarget,
 } from '@vercel/build-utils';
 import build from '../../../../src/commands/build';
@@ -22,21 +23,6 @@ import { useUser } from '../../../mocks/user';
 import { setupUnitFixture } from '../../../helpers/setup-unit-fixture';
 
 vi.setConfig({ testTimeout: 6 * 60 * 1000 });
-
-/**
- * Hydrate files map by adding FileFsRef entries for each filePathMap entry.
- * Based on the API's hydrateFilesMap function.
- */
-async function hydrateFilesMap(
-  files: Record<string, FileFsRef>,
-  filePathMap: Record<string, string>,
-  repoRootPath: string
-): Promise<void> {
-  for (const [funcPath, projectPath] of Object.entries(filePathMap)) {
-    const fsPath = join(repoRootPath, projectPath);
-    files[funcPath] = await FileFsRef.fromFsPath({ fsPath });
-  }
-}
 
 /**
  * Create a NodejsLambda from a .func directory in the build output.
@@ -62,7 +48,9 @@ async function createLambdaFromFuncDir(
     await hydrateFilesMap(
       files as Record<string, FileFsRef>,
       filePathMap,
-      workPath
+      {},
+      workPath,
+      new Map()
     );
   }
 
