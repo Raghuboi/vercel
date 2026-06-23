@@ -311,9 +311,19 @@ export class ServicesOrchestrator {
     this.proxyOrigin = options.proxyOrigin;
     this.envFilesValues = options.env;
     this.useImplicitEnvInjection = options.useImplicitEnvInjection;
-    this.pythonServiceCount = options.services.filter(
-      s => s.runtime === 'python'
-    ).length;
+    // Python services in one workspace intentionally share a managed virtualenv.
+    // Count environments, rather than processes, for the external-venv guard.
+    const pythonWorkspaces = options.services
+      .filter(service => service.runtime === 'python')
+      .map(service =>
+        path.resolve(
+          this.cwd,
+          isExperimentalServiceV2(service)
+            ? service.root || '.'
+            : service.workspace || '.'
+        )
+      );
+    this.pythonServiceCount = new Set(pythonWorkspaces).size;
     this.hasQueueServices = options.services
       .filter(isExperimentalService)
       .some(isQueueBackedService);

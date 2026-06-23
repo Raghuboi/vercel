@@ -472,12 +472,21 @@ export interface ProjectSettings {
   commandForIgnoringBuildStep?: string | null;
 }
 
+export interface DevQueueSubscriberTopic {
+  topic: string;
+  retryAfterSeconds?: number;
+  initialDelaySeconds?: number;
+  maxDeliveries?: number;
+  maxConcurrency?: number;
+}
+
 export interface DevQueueSubscriber {
   name: string;
   consumer: string;
   entrypoint: string;
+  moduleName: string;
   variableName: string;
-  topics: ServiceQueueTopic[];
+  topics: DevQueueSubscriberTopic[];
 }
 
 export interface GetDevQueueSubscribersOptions {
@@ -613,8 +622,6 @@ export interface ServiceQueueTopic {
   topic: string;
   retryAfterSeconds?: number;
   initialDelaySeconds?: number;
-  maxDeliveries?: number;
-  maxConcurrency?: number;
 }
 
 export type ServiceTopics = string[] | ServiceQueueTopic[];
@@ -637,6 +644,8 @@ export interface ExperimentalService {
   type: ServiceType;
   trigger?: JobTrigger;
   group?: string;
+  /** Queue consumer identifier, distinct from service grouping. */
+  consumer?: string;
   workspace: string;
   entrypoint?: string;
   framework?: string;

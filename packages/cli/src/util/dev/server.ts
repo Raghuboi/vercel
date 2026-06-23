@@ -192,6 +192,7 @@ export default class DevServer {
   private services?: Service[];
   private orchestrator?: ServicesOrchestrator;
   private queueBroker?: QueueBroker;
+  private pyprojectSubscriberBuilds: Builder[];
   private serviceRoutesTable?: Map<string, Route[]>;
 
   private vercelConfigWarning: boolean;
@@ -220,8 +221,8 @@ export default class DevServer {
   }
 
   // When pyproject.toml subscribers run, the web app is served on the normal dev
-  // path but must share the workers' managed virtualenv and sync its own
-  // dependencies, mirroring the `meta` the orchestrator passes its services.
+  // path but must share the workers' managed virtualenv. The subscribers finish
+  // synchronizing the shared project dependencies before the dev server is ready.
   //
   // `serviceCount > 0` routes the web app through the multi-service Python runner
   // so it uses the project's managed `.venv` (the same one the workers create),
@@ -231,16 +232,41 @@ export default class DevServer {
   // it would otherwise reject a valid setup where the user simply has a venv
   // activated.
   private getQueueWebServiceDevMeta(): {
-    syncDependencies?: boolean;
     serviceCount?: number;
   } {
     if (this.subscriberServices.length === 0) {
       return {};
     }
     return {
-      syncDependencies: true,
-      serviceCount: this.subscriberServices.length,
+      // All generated subscriber processes and the web app share one workspace
+      // and one managed environment, regardless of the number of subscribers.
+      serviceCount: 1,
     };
+  }
+
+  private getDevQueueEnv(): Record<string, string> {
+    return {
+      VERCEL_HAS_WORKER_SERVICES: '1',
+      VERCEL_QUEUE_BASE_URL: `${this.address.origin}/_svc/_queues`,
+      VERCEL_QUEUE_TOKEN: 'vc-dev-token',
+    };
+  }
+
+  private injectDevQueueEnv(): void {
+    Object.assign(this.envConfigs.runEnv, this.getDevQueueEnv());
+  }
+
+  private capturePyprojectSubscriberBuilds(builds: Builder[]): void {
+    const pythonBuilds = builds.filter(build => {
+      try {
+        return npa(build.use).name === '@vercel/python';
+      } catch {
+        return false;
+      }
+    });
+    if (pythonBuilds.length > 0) {
+      this.pyprojectSubscriberBuilds = pythonBuilds;
+    }
   }
 
   private async setupPyprojectSubscribers(): Promise<void> {
@@ -250,19 +276,21 @@ export default class DevServer {
 
     const services = await getPyprojectSubscriberServices({
       buildMatches: this.buildMatches.values(),
+      builds: this.devCommand ? this.pyprojectSubscriberBuilds : undefined,
       workPath: this.cwd,
     });
     if (services.length === 0) {
       return;
     }
     this.subscriberServices = services;
+    this.injectDevQueueEnv();
 
     // The web app is served on the normal dev path; the subscribers run as
     // worker services behind the dev queue broker, exactly like queue-triggered
     // `experimentalServices` workers. Queue producer env for the web app is
-    // injected in `_getVercelConfig` (so it survives every config rebuild); the
+    // injected immediately above and re-applied in `_getVercelConfig`; the
     // orchestrator injects it for the workers themselves via `getV1StartSpec`.
-    this.orchestrator = new ServicesOrchestrator({
+    const orchestrator = new ServicesOrchestrator({
       services,
       cwd: this.cwd,
       repoRoot: this.repoRoot,
@@ -270,10 +298,30 @@ export default class DevServer {
       proxyOrigin: this.address.origin,
       useImplicitEnvInjection: false,
     });
-    await this.orchestrator.startAll();
-    this.queueBroker = new QueueBroker(services, name =>
-      this.orchestrator!.getServiceOrigin(name)
+    this.orchestrator = orchestrator;
+    const queueBroker = new QueueBroker(services, name =>
+      orchestrator.getServiceOrigin(name)
     );
+    this.queueBroker = queueBroker;
+
+    try {
+      // Construct the broker before spawning workers so constructor failures
+      // cannot leave successfully-started subscriber processes behind.
+      await orchestrator.startAll();
+
+      // `_getVercelConfig()` may have started a custom Development Command
+      // before subscriber discovery. Restart it now that the local queue env is
+      // available, and only after its subscribers are ready to receive work.
+      if (this.devCommand) {
+        await this.runDevCommand(true);
+      }
+    } catch (err) {
+      queueBroker.stop();
+      this.queueBroker = undefined;
+      await orchestrator.stopAll();
+      this.orchestrator = undefined;
+      throw err;
+    }
 
     output.log(
       `Started ${services.length} ${plural(
@@ -294,6 +342,7 @@ export default class DevServer {
     this.originalProjectSettings = options.projectSettings;
     this.projectSettings = options.projectSettings;
     this.services = options.services;
+    this.pyprojectSubscriberBuilds = [];
     this.useImplicitServicesEnvInjection =
       options.useImplicitServicesEnvInjection ?? true;
     this.caseSensitive = false;
@@ -703,6 +752,8 @@ export default class DevServer {
       this.readJsonFile<VercelConfig>(configPath),
     ]);
 
+    this.pyprojectSubscriberBuilds = [];
+
     await this.validateVercelConfig(vercelConfig);
 
     this.projectSettings = {
@@ -766,6 +817,7 @@ export default class DevServer {
       }
 
       if (builders) {
+        this.capturePyprojectSubscriberBuilds(builders);
         if (this.devCommand || (this.services && this.services.length > 0)) {
           builders = builders.filter(filterFrontendBuilds);
         }
@@ -800,6 +852,7 @@ export default class DevServer {
     }
 
     if (Array.isArray(vercelConfig.builds)) {
+      this.capturePyprojectSubscriberBuilds(vercelConfig.builds);
       if (this.devCommand || (this.services && this.services.length > 0)) {
         vercelConfig.builds = vercelConfig.builds.filter(filterFrontendBuilds);
       }
@@ -887,14 +940,11 @@ export default class DevServer {
     // Point the web app (the queue producer, served on the normal dev path) at
     // the local dev queue broker and disable deployment pinning. The subscriber
     // workers get their own copy from the orchestrator's `getV1StartSpec`. This
-    // lives alongside the other platform-simulation vars so it is re-applied on
-    // every `_getVercelConfig` rebuild rather than as a one-shot mutation that
-    // later rebuilds would drop. Only `runEnv`, since `allEnv` is exposed to the
-    // user dev command.
+    // is re-applied on every config rebuild. Builder-managed web servers consume
+    // `runEnv`; custom Development Commands receive it directly in
+    // `runDevCommand()` so it is not exposed to build subprocesses via `allEnv`.
     if (this.subscriberServices.length > 0) {
-      runEnv['VERCEL_HAS_WORKER_SERVICES'] = '1';
-      runEnv['VERCEL_QUEUE_BASE_URL'] = `${this.address.origin}/_svc/_queues`;
-      runEnv['VERCEL_QUEUE_TOKEN'] = 'vc-dev-token';
+      Object.assign(runEnv, this.getDevQueueEnv());
     }
 
     this.envConfigs = { buildEnv, runEnv, allEnv };
@@ -2954,6 +3004,7 @@ export default class DevServer {
       },
       process.env,
       this.envConfigs.allEnv,
+      this.subscriberServices.length > 0 ? this.getDevQueueEnv() : undefined,
       {
         PORT: `${port}`,
       }

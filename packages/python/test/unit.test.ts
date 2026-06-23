@@ -2274,8 +2274,10 @@ describe('pyproject subscribers', () => {
   });
 
   it('returns dev queue consumer descriptors matching build consumer names', async () => {
+    const workerPackage = path.join(mockWorkPath, 'workers', 'celery');
+    fs.mkdirSync(workerPackage, { recursive: true });
     fs.writeFileSync(
-      path.join(mockWorkPath, 'worker.py'),
+      path.join(workerPackage, '__init__.py'),
       'from celery import Celery\napp = Celery("worker")\n'
     );
     fs.writeFileSync(
@@ -2286,7 +2288,7 @@ describe('pyproject subscribers', () => {
         'version = "0.0.1"',
         '',
         '[tool.vercel.subscribers.celery-worker]',
-        'entrypoint = "worker:app"',
+        'entrypoint = "workers.celery:app"',
         'topics = ["celery", "emails"]',
         'max_deliveries = 3',
         'retry_after_seconds = 10',
@@ -2304,7 +2306,8 @@ describe('pyproject subscribers', () => {
         consumer: sanitizeConsumerName(
           getSubscriberOutputPath('celery-worker')
         ),
-        entrypoint: 'worker.py',
+        entrypoint: 'workers/celery/__init__.py',
+        moduleName: 'workers.celery',
         variableName: 'app',
         topics: [
           {

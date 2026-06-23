@@ -133,6 +133,34 @@ interface DevPythonOptions {
   onStderr?: (buf: Buffer) => void;
 }
 
+function dedupePendingOperation<T>(
+  operations: Map<string, Promise<T>>,
+  key: string,
+  operation: () => Promise<T>
+): Promise<T> {
+  const existing = operations.get(key);
+  if (existing) {
+    return existing;
+  }
+
+  const pending = operation();
+  operations.set(key, pending);
+
+  const cleanup = () => {
+    if (operations.get(key) === pending) {
+      operations.delete(key);
+    }
+  };
+  void pending.then(cleanup, cleanup);
+
+  return pending;
+}
+
+// Multiple services in one workspace share a managed virtualenv and manifest.
+// Keep their startup paths from mutating those shared resources concurrently.
+const PENDING_MANAGED_VENV_CREATIONS = new Map<string, Promise<void>>();
+const PENDING_DEPENDENCY_SYNCS = new Map<string, Promise<void>>();
+
 async function syncDependencies({
   workPath,
   uvPath,
@@ -309,9 +337,10 @@ async function runSync({
   });
 }
 
-// Dedup concurrent installs: keyed by "targetDir:packageName" so parallel
-// requests to vc dev reuse the in-flight promise instead of spawning duplicates.
+// Reuse injected packages by target, package, and source so services sharing a
+// workspace never mutate the same install concurrently or reinstall it later.
 const PENDING_INSTALLS = new Map<string, Promise<void>>();
+const COMPLETED_INSTALLS = new Set<string>();
 
 interface InjectedPackageSpec {
   name: 'vercel-runtime' | 'vercel-workers';
@@ -324,15 +353,18 @@ async function installInjectedDevPackage(
   opts: DevPythonOptions
 ): Promise<void> {
   const targetDir = join(opts.workPath, '.vercel', 'python');
-  const key = `${targetDir}:${pkg.name}`;
+  const source = pkg.envOverride || pkg.pinnedVersion;
+  const key = `${targetDir}:${pkg.name}:${source}`;
 
-  let pending = PENDING_INSTALLS.get(key);
-  if (!pending) {
-    pending = doInstallInjectedDevPackage(pkg, { ...opts, targetDir });
-    PENDING_INSTALLS.set(key, pending);
-    pending.finally(() => PENDING_INSTALLS.delete(key));
+  if (COMPLETED_INSTALLS.has(key)) {
+    debug(`${pkg.name} is already installed for this dev session, skipping`);
+    return;
   }
-  await pending;
+
+  await dedupePendingOperation(PENDING_INSTALLS, key, async () => {
+    await doInstallInjectedDevPackage(pkg, { ...opts, targetDir });
+    COMPLETED_INSTALLS.add(key);
+  });
 }
 
 async function doInstallInjectedDevPackage(
@@ -562,6 +594,15 @@ async function getMultiServicePythonRunner(
   systemPython: string,
   uvPath: string | null
 ): Promise<PythonRunner> {
+  const venvPath = join(workPath, '.venv');
+
+  // A sibling service may already be creating this workspace's virtualenv.
+  // Wait before probing it so we never observe a partially-created environment.
+  const pendingCreation = PENDING_MANAGED_VENV_CREATIONS.get(venvPath);
+  if (pendingCreation) {
+    await pendingCreation;
+  }
+
   // Use an existing .venv/venv if present and allowed (single Python service in a project).
   const { pythonCmd, venvRoot } = useVirtualEnv(workPath, env, systemPython);
   if (venvRoot) {
@@ -569,14 +610,16 @@ async function getMultiServicePythonRunner(
     return { command: pythonCmd, args: [] };
   }
 
-  // Create a per-service .venv, so deps are managed separately.
-  const venvPath = join(workPath, '.venv');
-  await ensureVenv({
-    pythonVersion: { pythonPath: systemPython },
-    venvPath,
-    uvPath,
-    quiet: true,
-  });
+  // Create one managed .venv per workspace. Parallel services reuse the same
+  // in-flight creation rather than invoking uv against the directory together.
+  await dedupePendingOperation(PENDING_MANAGED_VENV_CREATIONS, venvPath, () =>
+    ensureVenv({
+      pythonVersion: { pythonPath: systemPython },
+      venvPath,
+      uvPath,
+      quiet: true,
+    })
+  );
   debug(`Created virtualenv at ${venvPath} for multi-service dev`);
 
   const pythonBin = getVenvPythonBin(venvPath);
@@ -694,7 +737,11 @@ export const startDevServer: StartDevServer = async opts => {
   }
   const { entrypoint: entry, variableName } = resolved;
 
-  const modulePath = entrypointToModule(entry);
+  const handlerModuleName =
+    typeof config?.handlerModuleName === 'string'
+      ? config.handlerModuleName
+      : undefined;
+  const modulePath = handlerModuleName || entrypointToModule(entry);
 
   // Track child process and listeners
   let childProcess: ChildProcess | null = null;
@@ -802,7 +849,9 @@ export const startDevServer: StartDevServer = async opts => {
         console.log(syncMessage);
       }
 
-      await syncDependencies(devOpts);
+      await dedupePendingOperation(PENDING_DEPENDENCY_SYNCS, workPath, () =>
+        syncDependencies(devOpts)
+      );
     }
 
     // vercel-runtime is a separate dependency that we need to install into .vercel/python/

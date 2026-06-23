@@ -111,6 +111,7 @@ export async function getDevQueueSubscribers({
     name: subscriber.name,
     consumer: getSubscriberConsumerName(subscriber.name),
     entrypoint: subscriber.entrypoint,
+    moduleName: subscriber.moduleName,
     variableName: subscriber.variableName,
     topics: subscriber.topics.map(topic => ({
       topic,

@@ -38,6 +38,7 @@ function makeQueueJobService(
     retryAfterSeconds?: number;
     initialDelaySeconds?: number;
     maxDeliveries?: number;
+    maxConcurrency?: number;
   }>
 ): ExperimentalService {
   return {
@@ -296,12 +297,13 @@ describe('QueueBroker', () => {
       expect(callHeaders()['ce-vqsconsumergroup']).toBe('processor');
     });
 
-    it('uses service group as the queue consumer while routing to service name', async () => {
+    it('uses the queue consumer while routing to the service name', async () => {
       broker = new QueueBroker(
         [
           {
             ...makeWorkerService('celery-worker', ['tasks-topic']),
-            group: '__py__subscribers_Scelery-worker',
+            consumer: 'celery-consumer',
+            group: 'deployment-group',
           },
         ],
         getServiceOrigin
@@ -311,9 +313,43 @@ describe('QueueBroker', () => {
       await vi.advanceTimersByTimeAsync(0);
 
       expect(getServiceOrigin).toHaveBeenCalledWith('celery-worker');
-      expect(callHeaders()['ce-vqsconsumergroup']).toBe(
-        '__py__subscribers_Scelery-worker'
+      expect(callHeaders()['ce-vqsconsumergroup']).toBe('celery-consumer');
+    });
+
+    it('honors configured maxConcurrency', async () => {
+      let resolveFirstRequest!: (response: {
+        ok: boolean;
+        status: number;
+      }) => void;
+      const firstRequest = new Promise<{ ok: boolean; status: number }>(
+        resolve => {
+          resolveFirstRequest = resolve;
+        }
       );
+      mockFetch.mockImplementationOnce(() => firstRequest as any);
+
+      broker = new QueueBroker(
+        [
+          makeQueueJobService('processor', [
+            {
+              topic: 'orders',
+              maxConcurrency: 1,
+            },
+          ]),
+        ],
+        getServiceOrigin
+      );
+
+      broker.enqueue('orders', Buffer.from('{"id":1}'), 'application/json');
+      broker.enqueue('orders', Buffer.from('{"id":2}'), 'application/json');
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(mockFetch).toHaveBeenCalledOnce();
+
+      resolveFirstRequest({ ok: true, status: 200 });
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      expect(mockFetch).toHaveBeenCalledTimes(2);
     });
 
     it('honors configured maxDeliveries', async () => {

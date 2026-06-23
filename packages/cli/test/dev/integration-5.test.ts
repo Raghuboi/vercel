@@ -983,15 +983,21 @@ describe('[vercel dev] Pyproject queue subscribers', () => {
     await fs.remove(resultsDir);
   });
 
-  test('[vercel dev] Celery task triggers pyproject subscriber execution', async () => {
+  test('[vercel dev] Celery tasks trigger package-based pyproject subscribers', async () => {
     const dir = fixture('pyproject-subscriber');
     const { dev, port, readyResolver } = await testFixture(
       dir,
       {
         skipNpmInstall: true,
+        // Both implicit subscribers share the fixture's managed venv. An
+        // unrelated activated venv must not trigger the multi-service guard.
+        env: {
+          VIRTUAL_ENV: join(process.cwd(), '.external-test-venv'),
+        },
       },
       ['--local']
     );
+    let devOutput = '';
 
     try {
       await readyResolver;
@@ -1001,25 +1007,49 @@ describe('[vercel dev] Pyproject queue subscribers', () => {
       });
       expect(enqueueRes.status).toBe(200);
       const enqueueJson = await enqueueRes.json();
-      expect(enqueueJson).toHaveProperty('requestId', 'dev-celery');
-      expect(enqueueJson).toHaveProperty('taskId');
+      expect(enqueueJson).toHaveProperty('requestIds', [
+        'dev-celery-high',
+        'dev-celery-low',
+      ]);
+      expect(enqueueJson.taskIds).toHaveLength(2);
+      expect(
+        enqueueJson.taskIds.every((id: unknown) => typeof id === 'string')
+      ).toBe(true);
 
-      const resultPath = join(resultsDir, 'result.json');
-      let result: any = null;
+      const highResultPath = join(resultsDir, 'high-priority.json');
+      const lowResultPath = join(resultsDir, 'low-priority.json');
+      let highResult: any = null;
+      let lowResult: any = null;
       for (let i = 0; i < 30; i++) {
         await sleep(500);
-        if (await fs.pathExists(resultPath)) {
-          result = await fs.readJson(resultPath);
+        if (
+          (await fs.pathExists(highResultPath)) &&
+          (await fs.pathExists(lowResultPath))
+        ) {
+          highResult = await fs.readJson(highResultPath);
+          lowResult = await fs.readJson(lowResultPath);
           break;
         }
       }
 
-      expect(result).not.toBeNull();
-      expect(result).toHaveProperty('requestId', 'dev-celery');
-      expect(result).toHaveProperty('sum', 42);
+      expect(highResult).toEqual({
+        requestId: 'dev-celery-high',
+        priority: 'high-priority',
+        sum: 42,
+      });
+      expect(lowResult).toEqual({
+        requestId: 'dev-celery-low',
+        priority: 'low-priority',
+        sum: 42,
+      });
     } finally {
-      await dev.kill();
+      const { stdout, stderr } = await dev.kill();
+      devOutput = `${stdout}\n${stderr}`;
     }
+
+    // Starting the lazy web app must not reinstall shared dependencies while
+    // its subscriber processes are importing from the same environment.
+    expect(devOutput).not.toContain('ModuleNotFoundError');
   });
 });
 

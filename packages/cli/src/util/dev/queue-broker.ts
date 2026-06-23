@@ -27,6 +27,8 @@ interface ConsumerGroup {
   serviceOriginFn: () => string | null;
   retryAfterMs: number;
   maxDeliveries: number;
+  maxConcurrency: number;
+  activeInvocations: number;
   initialDelayMs: number;
 }
 
@@ -35,6 +37,7 @@ interface DevServiceQueueTopic {
   retryAfterSeconds?: number;
   initialDelaySeconds?: number;
   maxDeliveries?: number;
+  maxConcurrency?: number;
 }
 
 type DeliveryStatus = 'pending' | 'in-flight' | 'acked';
@@ -58,6 +61,7 @@ export interface ReceivedMessage {
 
 const DEFAULT_RETRY_AFTER = ms('1m');
 const DEFAULT_MAX_DELIVERIES = 32;
+const DEFAULT_MAX_CONCURRENCY = Infinity;
 const DEFAULT_INITIAL_DELAY = 0;
 const DEFAULT_VISIBILITY_TIMEOUT = ms('1m');
 const DEFAULT_RETENTION = ms('1h');
@@ -95,7 +99,7 @@ export class QueueBroker {
       const topicConfigs = getServiceQueueTopicConfigs(
         service
       ) as DevServiceQueueTopic[];
-      const consumerGroup = service.group || service.name;
+      const consumerGroup = service.consumer || service.name;
       for (const topicConfig of topicConfigs) {
         const topicPattern = topicConfig.topic;
         const id = `${consumerGroup}::${topicPattern}`;
@@ -110,6 +114,8 @@ export class QueueBroker {
               ? topicConfig.retryAfterSeconds * 1000
               : DEFAULT_RETRY_AFTER,
           maxDeliveries: topicConfig.maxDeliveries ?? DEFAULT_MAX_DELIVERIES,
+          maxConcurrency: topicConfig.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY,
+          activeInvocations: 0,
           initialDelayMs:
             topicConfig.initialDelaySeconds !== undefined
               ? topicConfig.initialDelaySeconds * 1000
@@ -362,6 +368,10 @@ export class QueueBroker {
     const state = groupDeliveries.get(message.messageId);
     if (!state || state.status === 'acked') return;
 
+    if (group.activeInvocations >= group.maxConcurrency) {
+      return;
+    }
+
     if (state.deliveryCount >= group.maxDeliveries) {
       output.debug(
         `queues: message ${message.messageId} exceeded maxDeliveries (${group.maxDeliveries}) for group "${group.name}", dropping`
@@ -383,6 +393,7 @@ export class QueueBroker {
     state.receiptHandle = receiptHandle;
     state.deliveryCount++;
     state.leaseExpiresAt = Date.now() + DEFAULT_VISIBILITY_TIMEOUT;
+    group.activeInvocations++;
 
     const now = new Date().toISOString();
     const expiresAt = new Date(
@@ -426,6 +437,8 @@ export class QueueBroker {
         `queues: failed to dispatch CloudEvent to "${group.name}": ${err}`
       );
       this.handleDeliveryFailure(message.messageId, group);
+    } finally {
+      group.activeInvocations--;
     }
   }
 

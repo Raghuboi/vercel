@@ -4,4 +4,4 @@
 "@vercel/python": patch
 ---
 
-[python] pyproject.toml subscribers vc dev
+Add `vercel dev` support for Python queue subscribers defined in `pyproject.toml`.
