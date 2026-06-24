@@ -53,7 +53,6 @@ import {
   isOfficialRuntime,
   isExperimentalService,
   isExperimentalServiceV2,
-  type ExperimentalService,
   type Service,
 } from '@vercel/fs-detectors';
 import { frameworkList } from '@vercel/frameworks';
@@ -98,7 +97,7 @@ import type { ProjectSettings } from '@vercel-internals/types';
 import { treeKill } from '../tree-kill';
 import { ServicesOrchestrator } from './services-orchestrator';
 import { QueueBroker } from './queue-broker';
-import { getPyprojectSubscriberServices } from './python-subscriber-services';
+import { collectBuilderDevSidecars } from './dev-sidecars';
 import { injectNextDevWebSocketShimIfNeeded } from './next-dev-websocket-shim-injection';
 import { applyOverriddenHeaders, nodeHeadersToFetchHeaders } from './headers';
 import { formatQueryString, parseQueryString } from './parse-query-string';
@@ -191,8 +190,11 @@ export default class DevServer {
   private projectSettings?: ProjectSettings;
   private services?: Service[];
   private orchestrator?: ServicesOrchestrator;
+  private sidecarOrchestrator?: ServicesOrchestrator;
   private queueBroker?: QueueBroker;
-  private pyprojectSubscriberBuilds: Builder[];
+  private filteredSidecarBuilds: Builder[];
+  private sidecarBuildMatches: BuildMatch[];
+  private sidecars: Service[] = [];
   private serviceRoutesTable?: Map<string, Route[]>;
 
   private vercelConfigWarning: boolean;
@@ -205,43 +207,14 @@ export default class DevServer {
   private projectId?: string;
   private orgId?: string;
 
-  // pyproject.toml queue subscribers run as worker services behind the dev queue
-  // broker, alongside the primary web app which stays on the normal dev path.
-  // Tracked separately from `this.services` (explicitly-configured
-  // `experimentalServices`): the web app must NOT be treated as a service, since
-  // `this.services.length > 0` switches the dev server into services mode, which
-  // filters the web app's own build out of what gets served.
-  private subscriberServices: ExperimentalService[] = [];
-
   private shouldUseServicesOrchestrator(): boolean {
-    if (!this.services || this.services.length === 0) {
-      return false;
-    }
-    return true;
+    return Boolean(this.services && this.services.length > 0);
   }
 
-  // When pyproject.toml subscribers run, the web app is served on the normal dev
-  // path but must share the workers' managed virtualenv. The subscribers finish
-  // synchronizing the shared project dependencies before the dev server is ready.
-  //
-  // `serviceCount > 0` routes the web app through the multi-service Python runner
-  // so it uses the project's managed `.venv` (the same one the workers create),
-  // instead of any externally activated venv. `pythonServiceCount` is left unset
-  // (defaults to 1): the web app and workers share that single managed venv, so
-  // the "multiple managed venvs vs an activated venv" guardrail must NOT fire —
-  // it would otherwise reject a valid setup where the user simply has a venv
-  // activated.
-  private getQueueWebServiceDevMeta(): {
-    serviceCount?: number;
-  } {
-    if (this.subscriberServices.length === 0) {
-      return {};
-    }
-    return {
-      // All generated subscriber processes and the web app share one workspace
-      // and one managed environment, regardless of the number of subscribers.
-      serviceCount: 1,
-    };
+  private hasQueueSidecars(): boolean {
+    return this.sidecars
+      .filter(isExperimentalService)
+      .some(isQueueBackedService);
   }
 
   private getDevQueueEnv(): Record<string, string> {
@@ -256,77 +229,77 @@ export default class DevServer {
     Object.assign(this.envConfigs.runEnv, this.getDevQueueEnv());
   }
 
-  private capturePyprojectSubscriberBuilds(builds: Builder[]): void {
-    const pythonBuilds = builds.filter(build => {
-      try {
-        return npa(build.use).name === '@vercel/python';
-      } catch {
-        return false;
-      }
-    });
-    if (pythonBuilds.length > 0) {
-      this.pyprojectSubscriberBuilds = pythonBuilds;
-    }
+  private getSidecarDevMeta(match: BuildMatch): {
+    serviceCount?: number;
+  } {
+    const serviceCount = this.sidecars.filter(sidecar => {
+      if (sidecar.builder.use !== match.use) return false;
+      const workspace = isExperimentalService(sidecar)
+        ? sidecar.workspace
+        : sidecar.root;
+      return !workspace || workspace === '.';
+    }).length;
+
+    return serviceCount > 0 ? { serviceCount } : {};
   }
 
-  private async setupPyprojectSubscribers(): Promise<void> {
+  private async setupBuilderDevSidecars(): Promise<void> {
     if (this.shouldUseServicesOrchestrator()) {
       return;
     }
 
-    const services = await getPyprojectSubscriberServices({
-      buildMatches: this.buildMatches.values(),
-      builds: this.devCommand ? this.pyprojectSubscriberBuilds : undefined,
+    // Sidecar topology is resolved once at startup, like configured services;
+    // the individual service dev servers remain responsible for source reloads.
+    const sidecars = await collectBuilderDevSidecars({
+      buildMatches: this.sidecarBuildMatches,
       workPath: this.cwd,
     });
-    if (services.length === 0) {
+    if (sidecars.length === 0) {
       return;
     }
-    this.subscriberServices = services;
-    this.injectDevQueueEnv();
+    this.sidecars = sidecars;
 
-    // The web app is served on the normal dev path; the subscribers run as
-    // worker services behind the dev queue broker, exactly like queue-triggered
-    // `experimentalServices` workers. Queue producer env for the web app is
-    // injected immediately above and re-applied in `_getVercelConfig`; the
-    // orchestrator injects it for the workers themselves via `getV1StartSpec`.
+    const queueSidecars = sidecars
+      .filter(isExperimentalService)
+      .filter(isQueueBackedService);
+    if (queueSidecars.length > 0) {
+      this.injectDevQueueEnv();
+    }
+
     const orchestrator = new ServicesOrchestrator({
-      services,
+      services: sidecars,
       cwd: this.cwd,
       repoRoot: this.repoRoot,
       env: this.envConfigs.allEnv,
       proxyOrigin: this.address.origin,
       useImplicitEnvInjection: false,
+      preferServiceBuilder: true,
     });
-    this.orchestrator = orchestrator;
-    const queueBroker = new QueueBroker(services, name =>
-      orchestrator.getServiceOrigin(name)
-    );
+    this.sidecarOrchestrator = orchestrator;
+
+    const queueBroker =
+      queueSidecars.length > 0
+        ? new QueueBroker(queueSidecars, name =>
+            orchestrator.getServiceOrigin(name)
+          )
+        : undefined;
     this.queueBroker = queueBroker;
 
     try {
-      // Construct the broker before spawning workers so constructor failures
-      // cannot leave successfully-started subscriber processes behind.
       await orchestrator.startAll();
-
-      // `_getVercelConfig()` may have started a custom Development Command
-      // before subscriber discovery. Restart it now that the local queue env is
-      // available, and only after its subscribers are ready to receive work.
-      if (this.devCommand) {
-        await this.runDevCommand(true);
-      }
     } catch (err) {
-      queueBroker.stop();
+      queueBroker?.stop();
       this.queueBroker = undefined;
       await orchestrator.stopAll();
-      this.orchestrator = undefined;
+      this.sidecarOrchestrator = undefined;
+      this.sidecars = [];
       throw err;
     }
 
     output.log(
-      `Started ${services.length} ${plural(
-        'Python queue subscriber',
-        services.length
+      `Started ${sidecars.length} development ${plural(
+        'sidecar',
+        sidecars.length
       )}`
     );
   }
@@ -342,7 +315,8 @@ export default class DevServer {
     this.originalProjectSettings = options.projectSettings;
     this.projectSettings = options.projectSettings;
     this.services = options.services;
-    this.pyprojectSubscriberBuilds = [];
+    this.filteredSidecarBuilds = [];
+    this.sidecarBuildMatches = [];
     this.useImplicitServicesEnvInjection =
       options.useImplicitServicesEnvInjection ?? true;
     this.caseSensitive = false;
@@ -454,6 +428,7 @@ export default class DevServer {
 
     // Update the build matches in case an entrypoint was created or deleted
     await this.updateBuildMatches(vercelConfig);
+    await this.runDevCommand();
 
     const filesChangedArray = [...filesChanged];
     const filesRemovedArray = [...filesRemoved];
@@ -596,6 +571,19 @@ export default class DevServer {
       this,
       fileList
     );
+    const filteredMatches =
+      this.filteredSidecarBuilds.length > 0
+        ? await getBuildMatches(
+            {
+              ...vercelConfig,
+              builds: this.filteredSidecarBuilds,
+            },
+            this.cwd,
+            this,
+            fileList
+          )
+        : [];
+    this.sidecarBuildMatches = [...matches, ...filteredMatches];
     const sources = matches.map(m => m.src);
 
     if (isInitial && fileList.length === 0) {
@@ -752,7 +740,7 @@ export default class DevServer {
       this.readJsonFile<VercelConfig>(configPath),
     ]);
 
-    this.pyprojectSubscriberBuilds = [];
+    this.filteredSidecarBuilds = [];
 
     await this.validateVercelConfig(vercelConfig);
 
@@ -790,7 +778,7 @@ export default class DevServer {
         trailingSlash,
         workPath: this.cwd,
       });
-      let {
+      const {
         builders,
         warnings,
         errors,
@@ -817,11 +805,6 @@ export default class DevServer {
       }
 
       if (builders) {
-        this.capturePyprojectSubscriberBuilds(builders);
-        if (this.devCommand || (this.services && this.services.length > 0)) {
-          builders = builders.filter(filterFrontendBuilds);
-        }
-
         vercelConfig.builds = vercelConfig.builds || [];
         vercelConfig.builds.push(...builders);
 
@@ -852,7 +835,11 @@ export default class DevServer {
     }
 
     if (Array.isArray(vercelConfig.builds)) {
-      this.capturePyprojectSubscriberBuilds(vercelConfig.builds);
+      if (this.devCommand) {
+        this.filteredSidecarBuilds = vercelConfig.builds.filter(
+          build => !filterFrontendBuilds(build)
+        );
+      }
       if (this.devCommand || (this.services && this.services.length > 0)) {
         vercelConfig.builds = vercelConfig.builds.filter(filterFrontendBuilds);
       }
@@ -937,21 +924,12 @@ export default class DevServer {
       runEnv['VERCEL_REGION'] = 'dev1';
     }
 
-    // Point the web app (the queue producer, served on the normal dev path) at
-    // the local dev queue broker and disable deployment pinning. The subscriber
-    // workers get their own copy from the orchestrator's `getV1StartSpec`. This
-    // is re-applied on every config rebuild. Builder-managed web servers consume
-    // `runEnv`; custom Development Commands receive it directly in
-    // `runDevCommand()` so it is not exposed to build subprocesses via `allEnv`.
-    if (this.subscriberServices.length > 0) {
+    // Reapply queue configuration when a config refresh recreates runEnv.
+    if (this.hasQueueSidecars()) {
       Object.assign(runEnv, this.getDevQueueEnv());
     }
 
     this.envConfigs = { buildEnv, runEnv, allEnv };
-
-    // If the `devCommand` was modified via project settings
-    // overrides then the dev process needs to be restarted
-    await this.runDevCommand();
 
     return vercelConfig;
   }
@@ -1184,8 +1162,6 @@ export default class DevServer {
       } else {
         output.print(`  ${link(addressFormatted)}\n`);
       }
-    } else {
-      devCommandPromise = this.runDevCommand();
     }
 
     const files = await getFiles(this.cwd, {});
@@ -1202,7 +1178,14 @@ export default class DevServer {
 
     await this.updateBuildMatches(vercelConfig, true);
 
-    await this.setupPyprojectSubscribers();
+    await this.setupBuilderDevSidecars();
+
+    if (!this.shouldUseServicesOrchestrator()) {
+      devCommandPromise = this.runDevCommand();
+      // Startup continues in parallel below, but observe early failures until
+      // the promise is awaited once the proxy is ready.
+      void devCommandPromise.catch(() => {});
+    }
 
     // Builders that do not define a `shouldServe()` function need to be
     // executed at boot-up time in order to get the initial assets and/or routes
@@ -1251,9 +1234,11 @@ export default class DevServer {
     this.server.on('upgrade', async (req, socket, head) => {
       await this.startPromise;
 
-      if (this.orchestrator) {
+      if (this.orchestrator || this.sidecarOrchestrator) {
         const pathname = url.parse(req.url || '/').pathname || '/';
-        const service = this.orchestrator.getServiceForRoute(pathname);
+        const service =
+          this.orchestrator?.getServiceForRoute(pathname) ||
+          this.sidecarOrchestrator?.getServiceForRoute(pathname);
         if (service) {
           const target = `http://${service.host}:${service.port}`;
           output.debug(
@@ -1262,10 +1247,10 @@ export default class DevServer {
           this.proxy.ws(req, socket, head, { target });
           return;
         }
-        output.debug(
-          `Detected "upgrade" event, but no matching service found for ${pathname}`
-        );
-        if (this.shouldUseServicesOrchestrator()) {
+        if (this.orchestrator) {
+          output.debug(
+            `Detected "upgrade" event, but no matching service found for ${pathname}`
+          );
           socket.destroy();
           return;
         }
@@ -1300,7 +1285,7 @@ export default class DevServer {
                 isDev: true,
                 requestPath: pathname,
                 devCacheDir: this.devCacheDir,
-                ...this.getQueueWebServiceDevMeta(),
+                ...this.getSidecarDevMeta(match),
                 env: { ...this.envConfigs.runEnv },
                 buildEnv: { ...this.envConfigs.buildEnv },
               },
@@ -1330,7 +1315,7 @@ export default class DevServer {
     await devCommandPromise;
 
     // For multi-service mode, URLs were already printed.
-    if (!this.shouldUseServicesOrchestrator()) {
+    if (!this.orchestrator?.hasServices()) {
       let addressFormatted = this.address.toString();
       if (this.address.pathname === '/' && this.address.protocol === 'http:') {
         // log address without trailing slash to maintain backwards compatibility
@@ -1361,6 +1346,9 @@ export default class DevServer {
 
     if (this.orchestrator) {
       ops.push(this.orchestrator.stopAll());
+    }
+    if (this.sidecarOrchestrator) {
+      ops.push(this.sidecarOrchestrator.stopAll());
     }
 
     if (this.queueBroker) {
@@ -1570,7 +1558,7 @@ export default class DevServer {
   private getServiceRouteTable(serviceName: string): Route[] {
     if (!this.serviceRoutesTable) {
       this.serviceRoutesTable = new Map();
-      for (const service of this.services || []) {
+      for (const service of [...(this.services || []), ...this.sidecars]) {
         if (!isExperimentalServiceV2(service)) continue;
 
         const { routes, error } = getTransformedRoutes({
@@ -1604,7 +1592,9 @@ export default class DevServer {
     const { debug } = output;
     const { service: serviceName, path: destPath } = matchedRoute.destination;
 
-    const origin = this.orchestrator?.getServiceOrigin(serviceName);
+    const origin =
+      this.orchestrator?.getServiceOrigin(serviceName) ||
+      this.sidecarOrchestrator?.getServiceOrigin(serviceName);
     if (!origin) {
       output.error(
         `Cannot route to service ${cmd(serviceName)}: it is not running.`
@@ -2089,9 +2079,11 @@ export default class DevServer {
     }
 
     // With multi-service setup, try to route to the appropriate service first
-    if (callLevel === 0 && this.orchestrator) {
+    if (callLevel === 0 && (this.orchestrator || this.sidecarOrchestrator)) {
       const pathname = parsed.pathname || '/';
-      const service = this.orchestrator.getServiceForRoute(pathname);
+      const service =
+        this.orchestrator?.getServiceForRoute(pathname) ||
+        this.sidecarOrchestrator?.getServiceForRoute(pathname);
       if (service) {
         debug(`Found service: ${service.name}`);
         const upstream = `http://${service.host}:${service.port}`;
@@ -2347,7 +2339,7 @@ export default class DevServer {
 
       if (
         callLevel === 0 &&
-        this.orchestrator &&
+        (this.orchestrator || this.sidecarOrchestrator) &&
         !routeResult.continue &&
         isServiceDestination(routeResult.matched_route)
       ) {
@@ -2622,7 +2614,7 @@ export default class DevServer {
             isDev: true,
             requestPath,
             devCacheDir,
-            ...this.getQueueWebServiceDevMeta(),
+            ...this.getSidecarDevMeta(match),
             env: {
               ...envConfigs.runEnv,
               VERCEL_DEBUG_PREFIX: output.debugEnabled
@@ -2980,12 +2972,14 @@ export default class DevServer {
 
     this.currentDevCommand = devCommand;
 
-    if (!devCommand) {
-      return;
-    }
-
     if (this.devProcess) {
       await treeKill(this.devProcess.pid!);
+      this.devProcess = undefined;
+      this.devProcessOrigin = undefined;
+    }
+
+    if (!devCommand) {
+      return;
     }
 
     output.log(`Running Dev Command ${chalk.cyan.bold(`“${devCommand}”`)}`);
@@ -3004,7 +2998,7 @@ export default class DevServer {
       },
       process.env,
       this.envConfigs.allEnv,
-      this.subscriberServices.length > 0 ? this.getDevQueueEnv() : undefined,
+      this.hasQueueSidecars() ? this.getDevQueueEnv() : undefined,
       {
         PORT: `${port}`,
       }

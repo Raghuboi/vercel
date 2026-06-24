@@ -25,11 +25,11 @@ import {
   type BuildOptions,
   type GlobOptions,
   type BuildVX,
+  type DevSidecar,
   type Files,
+  type GetDevSidecarsOptions,
   type ShouldServe,
   type TriggerEvent,
-  type DevQueueSubscriber,
-  type GetDevQueueSubscribersOptions,
   FileFsRef,
   PythonFramework,
   type PrepareCache,
@@ -103,16 +103,36 @@ export { detectEntrypoint } from './entrypoint';
 
 export const version = -1;
 
-export async function getDevQueueSubscribers({
+export async function getDevSidecars({
   workPath,
-}: GetDevQueueSubscribersOptions): Promise<DevQueueSubscriber[]> {
+  build,
+}: GetDevSidecarsOptions): Promise<DevSidecar[]> {
+  const framework = build.config?.framework;
+  if (
+    build.config?.middleware === true ||
+    typeof framework !== 'string' ||
+    !isPythonFramework(framework)
+  ) {
+    return [];
+  }
+
   const subscribers = await getPyprojectSubscribers(workPath);
   return subscribers.map(subscriber => ({
+    schema: 'experimentalServices',
     name: subscriber.name,
+    type: 'worker',
+    trigger: 'queue',
     consumer: getSubscriberConsumerName(subscriber.name),
-    entrypoint: subscriber.entrypoint,
-    moduleName: subscriber.moduleName,
-    variableName: subscriber.variableName,
+    workspace: '.',
+    framework,
+    runtime: 'python',
+    builder: {
+      use: build.use,
+      src: subscriber.entrypoint,
+      config: {
+        handlerFunction: subscriber.variableName,
+      },
+    },
     topics: subscriber.topics.map(topic => ({
       topic,
       ...subscriber.triggerDefaults,

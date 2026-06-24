@@ -62,7 +62,7 @@ import {
   getInstalledPythonsFromFilesystem,
 } from '../src/version';
 import type { PythonConstraint, PythonPackage } from '@vercel/python-analysis';
-import { build, getDevQueueSubscribers, prepareCache } from '../src/index';
+import { build, getDevSidecars, prepareCache } from '../src/index';
 import type { BuildResultV3, BuildResultV2 } from '@vercel/build-utils';
 import { createVenvEnv, getVenvBinDir } from '../src/utils';
 import {
@@ -1941,6 +1941,9 @@ describe('entrypointToModule', () => {
       'backend.api.server'
     );
     expect(entrypointToModule('src/main.py')).toBe('src.main');
+    expect(entrypointToModule('workers/celery/__init__.py')).toBe(
+      'workers.celery'
+    );
   });
 
   it('handles backslashes on Windows-style paths', () => {
@@ -2273,7 +2276,7 @@ describe('pyproject subscribers', () => {
     }
   });
 
-  it('returns dev queue consumer descriptors matching build consumer names', async () => {
+  it('returns dev sidecars matching build consumer names', async () => {
     const workerPackage = path.join(mockWorkPath, 'workers', 'celery');
     fs.mkdirSync(workerPackage, { recursive: true });
     fs.writeFileSync(
@@ -2299,16 +2302,33 @@ describe('pyproject subscribers', () => {
     );
 
     await expect(
-      getDevQueueSubscribers({ workPath: mockWorkPath })
+      getDevSidecars({
+        workPath: mockWorkPath,
+        build: {
+          use: '@vercel/python',
+          src: '<detect>',
+          config: { framework: 'fastapi' },
+        },
+      })
     ).resolves.toEqual([
       {
+        schema: 'experimentalServices',
         name: 'celery-worker',
+        type: 'worker',
+        trigger: 'queue',
         consumer: sanitizeConsumerName(
           getSubscriberOutputPath('celery-worker')
         ),
-        entrypoint: 'workers/celery/__init__.py',
-        moduleName: 'workers.celery',
-        variableName: 'app',
+        workspace: '.',
+        framework: 'fastapi',
+        runtime: 'python',
+        builder: {
+          use: '@vercel/python',
+          src: 'workers/celery/__init__.py',
+          config: {
+            handlerFunction: 'app',
+          },
+        },
         topics: [
           {
             topic: 'celery',
@@ -2327,6 +2347,25 @@ describe('pyproject subscribers', () => {
         ],
       },
     ]);
+  });
+
+  it('only contributes dev sidecars for standalone Python framework builds', async () => {
+    await expect(
+      getDevSidecars({
+        workPath: mockWorkPath,
+        build: { use: '@vercel/python', config: {} },
+      })
+    ).resolves.toEqual([]);
+
+    await expect(
+      getDevSidecars({
+        workPath: mockWorkPath,
+        build: {
+          use: '@vercel/python',
+          config: { framework: 'fastapi', middleware: true },
+        },
+      })
+    ).resolves.toEqual([]);
   });
 
   it('emits one queue/v2beta worker lambda per subscriber with all topics attached', async () => {

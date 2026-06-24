@@ -208,6 +208,7 @@ interface ServicesOrchestratorOptions {
   env: NodeJS.ProcessEnv;
   proxyOrigin: string;
   useImplicitEnvInjection: boolean;
+  preferServiceBuilder?: boolean;
 }
 
 // Max time we wait between SIGTERM and SIGKILL when force-stopping a service.
@@ -302,6 +303,7 @@ export class ServicesOrchestrator {
   private pythonServiceCount: number;
   private hasQueueServices: boolean;
   private useImplicitEnvInjection: boolean;
+  private preferServiceBuilder: boolean;
 
   constructor(options: ServicesOrchestratorOptions) {
     this.services = options.services;
@@ -311,6 +313,7 @@ export class ServicesOrchestrator {
     this.proxyOrigin = options.proxyOrigin;
     this.envFilesValues = options.env;
     this.useImplicitEnvInjection = options.useImplicitEnvInjection;
+    this.preferServiceBuilder = options.preferServiceBuilder ?? false;
     // Python services in one workspace intentionally share a managed virtualenv.
     // Count environments, rather than processes, for the external-venv guard.
     const pythonWorkspaces = options.services
@@ -663,8 +666,9 @@ export class ServicesOrchestrator {
       rootPath: path.join(this.cwd, workspace),
       rootLabel: workspace,
       framework,
-      // Prefer the framework's useRuntime, falling back to the resolved builder.
-      builderSpec: framework?.useRuntime?.use || service.builder?.use,
+      builderSpec: this.preferServiceBuilder
+        ? service.builder?.use || framework?.useRuntime?.use
+        : framework?.useRuntime?.use || service.builder?.use,
       entrypoint: getEntrypointForService(
         service.builder?.src,
         service.entrypoint,
@@ -701,7 +705,9 @@ export class ServicesOrchestrator {
       rootPath: path.join(this.cwd, root),
       rootLabel: root,
       framework,
-      builderSpec: framework?.useRuntime?.use || service.builder?.use,
+      builderSpec: this.preferServiceBuilder
+        ? service.builder?.use || framework?.useRuntime?.use
+        : framework?.useRuntime?.use || service.builder?.use,
       entrypoint: getEntrypointForService(
         service.builder?.src,
         service.entrypoint,

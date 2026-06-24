@@ -737,11 +737,7 @@ export const startDevServer: StartDevServer = async opts => {
   }
   const { entrypoint: entry, variableName } = resolved;
 
-  const handlerModuleName =
-    typeof config?.handlerModuleName === 'string'
-      ? config.handlerModuleName
-      : undefined;
-  const modulePath = handlerModuleName || entrypointToModule(entry);
+  const modulePath = entrypointToModule(entry);
 
   // Track child process and listeners
   let childProcess: ChildProcess | null = null;

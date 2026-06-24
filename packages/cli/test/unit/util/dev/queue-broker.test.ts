@@ -24,7 +24,6 @@ function makeWorkerService(
     schema: 'experimentalServices',
     name,
     type: 'worker',
-    consumer: name,
     workspace: '.',
     builder: { src: 'index.ts', use: '@vercel/node' },
     topics,
@@ -316,7 +315,7 @@ describe('QueueBroker', () => {
       expect(callHeaders()['ce-vqsconsumergroup']).toBe('celery-consumer');
     });
 
-    it('honors configured maxConcurrency', async () => {
+    it('honors maxConcurrency across every topic for a consumer', async () => {
       let resolveFirstRequest!: (response: {
         ok: boolean;
         status: number;
@@ -335,13 +334,17 @@ describe('QueueBroker', () => {
               topic: 'orders',
               maxConcurrency: 1,
             },
+            {
+              topic: 'events',
+              maxConcurrency: 1,
+            },
           ]),
         ],
         getServiceOrigin
       );
 
       broker.enqueue('orders', Buffer.from('{"id":1}'), 'application/json');
-      broker.enqueue('orders', Buffer.from('{"id":2}'), 'application/json');
+      broker.enqueue('events', Buffer.from('{"id":2}'), 'application/json');
       await vi.advanceTimersByTimeAsync(0);
 
       expect(mockFetch).toHaveBeenCalledOnce();
@@ -453,6 +456,30 @@ describe('QueueBroker', () => {
       );
 
       expect(broker.receiveById(messageId, 'unknown-group')).toBeNull();
+    });
+  });
+
+  describe('receiveMessages', () => {
+    it('selects the matching topic for a multi-topic consumer', () => {
+      broker = new QueueBroker(
+        [
+          {
+            ...makeWorkerService('multi-worker', ['orders', 'events']),
+            consumer: 'shared-consumer',
+          },
+        ],
+        getServiceOrigin
+      );
+
+      broker.enqueue('events', Buffer.from('{"kind":"event"}'), 'text/plain', {
+        delaySeconds: 1,
+      });
+      vi.setSystemTime(Date.now() + 2_000);
+
+      const messages = broker.receiveMessages('events', 'shared-consumer');
+      expect(messages).toHaveLength(1);
+      expect(messages[0].payload.toString()).toBe('{"kind":"event"}');
+      expect(mockFetch).not.toHaveBeenCalled();
     });
   });
 

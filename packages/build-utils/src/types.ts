@@ -472,30 +472,29 @@ export interface ProjectSettings {
   commandForIgnoringBuildStep?: string | null;
 }
 
-export interface DevQueueSubscriberTopic {
-  topic: string;
-  retryAfterSeconds?: number;
-  initialDelaySeconds?: number;
+export interface GetDevSidecarsOptions {
+  workPath: string;
+  /** Original build configuration before source expansion or dev filtering. */
+  build: Builder;
+}
+
+export interface DevSidecarQueueTopic extends ServiceQueueTopic {
   maxDeliveries?: number;
   maxConcurrency?: number;
 }
 
-export interface DevQueueSubscriber {
-  name: string;
-  consumer: string;
-  entrypoint: string;
-  moduleName: string;
-  variableName: string;
-  topics: DevQueueSubscriberTopic[];
-}
+export type DevSidecarV1 = Omit<ExperimentalService, 'topics'> & {
+  /** Queue consumer identifier, distinct from service grouping. */
+  consumer?: string;
+  topics?: string[] | DevSidecarQueueTopic[];
+};
 
-export interface GetDevQueueSubscribersOptions {
-  workPath: string;
-}
+export type DevSidecar = DevSidecarV1 | ExperimentalServiceV2;
 
-export type GetDevQueueSubscribers = (
-  options: GetDevQueueSubscribersOptions
-) => Promise<DevQueueSubscriber[]>;
+/** Returns sidecar services that a builder needs alongside its primary dev server. */
+export type GetDevSidecars = (
+  options: GetDevSidecarsOptions
+) => Promise<DevSidecar[]>;
 
 /*
  * This is a builder whose build output version may dynamically change.
@@ -507,7 +506,7 @@ export interface BuilderVX {
   prepareCache?: PrepareCache;
   shouldServe?: ShouldServe;
   startDevServer?: StartDevServer;
-  getDevQueueSubscribers?: GetDevQueueSubscribers;
+  getDevSidecars?: GetDevSidecars;
 }
 
 export interface BuilderV2 {
@@ -517,7 +516,7 @@ export interface BuilderV2 {
   prepareCache?: PrepareCache;
   shouldServe?: ShouldServe;
   startDevServer?: StartDevServer;
-  getDevQueueSubscribers?: GetDevQueueSubscribers;
+  getDevSidecars?: GetDevSidecars;
 }
 
 export interface BuilderV3 {
@@ -527,7 +526,7 @@ export interface BuilderV3 {
   prepareCache?: PrepareCache;
   shouldServe?: ShouldServe;
   startDevServer?: StartDevServer;
-  getDevQueueSubscribers?: GetDevQueueSubscribers;
+  getDevSidecars?: GetDevSidecars;
 }
 
 type ImageFormat = 'image/avif' | 'image/webp';
@@ -644,8 +643,6 @@ export interface ExperimentalService {
   type: ServiceType;
   trigger?: JobTrigger;
   group?: string;
-  /** Queue consumer identifier, distinct from service grouping. */
-  consumer?: string;
   workspace: string;
   entrypoint?: string;
   framework?: string;

@@ -7,6 +7,8 @@ import type { ExperimentalService } from '@vercel/fs-detectors';
 import {
   getServiceQueueTopicConfigs,
   isQueueBackedService,
+  type DevSidecarQueueTopic,
+  type DevSidecarV1,
 } from '@vercel/build-utils';
 import output from '../../output-manager';
 
@@ -27,17 +29,13 @@ interface ConsumerGroup {
   serviceOriginFn: () => string | null;
   retryAfterMs: number;
   maxDeliveries: number;
-  maxConcurrency: number;
-  activeInvocations: number;
+  concurrency: ConsumerConcurrency;
   initialDelayMs: number;
 }
 
-interface DevServiceQueueTopic {
-  topic: string;
-  retryAfterSeconds?: number;
-  initialDelaySeconds?: number;
-  maxDeliveries?: number;
-  maxConcurrency?: number;
+interface ConsumerConcurrency {
+  max: number;
+  activeInvocations: number;
 }
 
 type DeliveryStatus = 'pending' | 'in-flight' | 'acked';
@@ -90,19 +88,34 @@ export class QueueBroker {
   private tickTimer: ReturnType<typeof setInterval>;
 
   constructor(
-    services: ExperimentalService[],
+    services: Array<ExperimentalService | DevSidecarV1>,
     private getServiceOrigin: (name: string) => string | null
   ) {
+    const consumerConcurrency = new Map<string, ConsumerConcurrency>();
+
     for (const service of services) {
       if (!isQueueBackedService(service)) continue;
 
       const topicConfigs = getServiceQueueTopicConfigs(
         service
-      ) as DevServiceQueueTopic[];
-      const consumerGroup = service.consumer || service.name;
+      ) as DevSidecarQueueTopic[];
+      const consumer =
+        'consumer' in service && typeof service.consumer === 'string'
+          ? service.consumer
+          : undefined;
+      const consumerGroup = consumer || service.name;
       for (const topicConfig of topicConfigs) {
         const topicPattern = topicConfig.topic;
         const id = `${consumerGroup}::${topicPattern}`;
+        const maxConcurrency =
+          topicConfig.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY;
+        let concurrency = consumerConcurrency.get(consumerGroup);
+        if (concurrency) {
+          concurrency.max = Math.min(concurrency.max, maxConcurrency);
+        } else {
+          concurrency = { max: maxConcurrency, activeInvocations: 0 };
+          consumerConcurrency.set(consumerGroup, concurrency);
+        }
         const group: ConsumerGroup = {
           id,
           name: consumerGroup,
@@ -114,8 +127,7 @@ export class QueueBroker {
               ? topicConfig.retryAfterSeconds * 1000
               : DEFAULT_RETRY_AFTER,
           maxDeliveries: topicConfig.maxDeliveries ?? DEFAULT_MAX_DELIVERIES,
-          maxConcurrency: topicConfig.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY,
-          activeInvocations: 0,
+          concurrency,
           initialDelayMs:
             topicConfig.initialDelaySeconds !== undefined
               ? topicConfig.initialDelaySeconds * 1000
@@ -368,7 +380,7 @@ export class QueueBroker {
     const state = groupDeliveries.get(message.messageId);
     if (!state || state.status === 'acked') return;
 
-    if (group.activeInvocations >= group.maxConcurrency) {
+    if (group.concurrency.activeInvocations >= group.concurrency.max) {
       return;
     }
 
@@ -393,7 +405,7 @@ export class QueueBroker {
     state.receiptHandle = receiptHandle;
     state.deliveryCount++;
     state.leaseExpiresAt = Date.now() + DEFAULT_VISIBILITY_TIMEOUT;
-    group.activeInvocations++;
+    group.concurrency.activeInvocations++;
 
     const now = new Date().toISOString();
     const expiresAt = new Date(
@@ -438,7 +450,7 @@ export class QueueBroker {
       );
       this.handleDeliveryFailure(message.messageId, group);
     } finally {
-      group.activeInvocations--;
+      group.concurrency.activeInvocations--;
     }
   }
 

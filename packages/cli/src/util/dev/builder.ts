@@ -639,6 +639,7 @@ export async function getBuildMatches(
 
       matches.push({
         ...buildConfig,
+        buildConfig,
         src,
         entrypoint,
         builderWithPkg,
