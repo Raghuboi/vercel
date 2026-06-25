@@ -2293,7 +2293,8 @@ describe('pyproject subscribers', () => {
         '[tool.vercel.subscribers.celery-worker]',
         'entrypoint = "workers.celery:app"',
         'topics = ["celery"]',
-        'max_concurrency = 5',
+        'retry_after_seconds = 10',
+        'initial_delay_seconds = 0',
         '',
       ].join('\n')
     );
@@ -2324,7 +2325,13 @@ describe('pyproject subscribers', () => {
             handlerFunction: 'app',
           },
         },
-        topics: [{ topic: 'celery', maxConcurrency: 5 }],
+        topics: [
+          {
+            topic: 'celery',
+            retryAfterSeconds: 10,
+            initialDelaySeconds: 0,
+          },
+        ],
       },
     ]);
   });

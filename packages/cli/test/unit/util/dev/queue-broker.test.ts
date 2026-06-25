@@ -1,6 +1,6 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import type { ExperimentalService } from '@vercel/fs-detectors';
-import type { DevSubscriber } from '@vercel/build-utils';
+import type { ServiceQueueTopic, ServiceTopics } from '@vercel/build-utils';
 import {
   QueueBroker,
   topicPatternToRegex,
@@ -19,7 +19,7 @@ const mockFetch = vi.mocked(nodeFetch);
 
 function makeWorkerService(
   name: string,
-  topics: DevSubscriber['topics'] = ['default']
+  topics: ServiceTopics = ['default']
 ): ExperimentalService {
   return {
     schema: 'experimentalServices',
@@ -33,11 +33,7 @@ function makeWorkerService(
 
 function makeQueueJobService(
   name: string,
-  topics: Array<{
-    topic: string;
-    retryAfterSeconds?: number;
-    initialDelaySeconds?: number;
-  }>
+  topics: ServiceQueueTopic[]
 ): ExperimentalService {
   return {
     schema: 'experimentalServices',
@@ -332,59 +328,6 @@ describe('QueueBroker', () => {
       await vi.advanceTimersByTimeAsync(2_000);
       expect(mockFetch).toHaveBeenCalledOnce();
       expect(callHeaders()['ce-vqsconsumergroup']).toBe('processor');
-    });
-
-    it("honors maxConcurrency across a consumer's topics", async () => {
-      let resolveFirstRequest!: (value: {
-        ok: boolean;
-        status: number;
-      }) => void;
-      mockFetch.mockImplementationOnce(
-        () =>
-          new Promise(resolve => {
-            resolveFirstRequest = resolve;
-          }) as any
-      );
-      broker = new QueueBroker(
-        [
-          makeWorkerService('processor', [
-            { topic: 'orders', maxConcurrency: 1 },
-            { topic: 'events', maxConcurrency: 1 },
-          ]),
-        ],
-        getServiceOrigin
-      );
-
-      broker.enqueue('orders', Buffer.from('{}'), 'application/json');
-      broker.enqueue('events', Buffer.from('{}'), 'application/json');
-      await vi.advanceTimersByTimeAsync(0);
-      expect(mockFetch).toHaveBeenCalledOnce();
-
-      resolveFirstRequest({ ok: true, status: 200 });
-      await vi.advanceTimersByTimeAsync(1_000);
-      expect(mockFetch).toHaveBeenCalledTimes(2);
-    });
-
-    it('honors maxDeliveries', async () => {
-      mockFetch.mockResolvedValue({ ok: false, status: 500 } as any);
-      broker = new QueueBroker(
-        [
-          makeWorkerService('processor', [
-            { topic: 'orders', retryAfterSeconds: 1, maxDeliveries: 1 },
-          ]),
-        ],
-        getServiceOrigin
-      );
-
-      const { messageId } = broker.enqueue(
-        'orders',
-        Buffer.from('{}'),
-        'application/json'
-      );
-      await vi.advanceTimersByTimeAsync(1_000);
-
-      expect(mockFetch).toHaveBeenCalledOnce();
-      expect(broker.receiveById(messageId, 'processor')).toBeNull();
     });
 
     it('does not dispatch delayed messages immediately', async () => {

@@ -28,6 +28,7 @@ import {
   type DevSubscriber,
   type Files,
   type GetDevSidecarsOptions,
+  type ServiceQueueTopic,
   type ShouldServe,
   type TriggerEvent,
   FileFsRef,
@@ -103,6 +104,15 @@ export { detectEntrypoint } from './entrypoint';
 
 export const version = -1;
 
+function getDevSubscriberTopics(subscriber: Subscriber): ServiceQueueTopic[] {
+  const { retryAfterSeconds, initialDelaySeconds } = subscriber.triggerDefaults;
+  return subscriber.topics.map(topic => ({
+    topic,
+    ...(retryAfterSeconds === undefined ? {} : { retryAfterSeconds }),
+    ...(initialDelaySeconds === undefined ? {} : { initialDelaySeconds }),
+  }));
+}
+
 export async function getDevSidecars({
   workPath,
   build,
@@ -131,10 +141,7 @@ export async function getDevSidecars({
         handlerFunction: subscriber.variableName,
       },
     },
-    topics: subscriber.topics.map(topic => ({
-      topic,
-      ...subscriber.triggerDefaults,
-    })),
+    topics: getDevSubscriberTopics(subscriber),
   }));
 }
 

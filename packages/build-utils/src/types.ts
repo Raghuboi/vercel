@@ -478,11 +478,6 @@ export interface GetDevSidecarsOptions {
   build: Builder;
 }
 
-export interface DevSubscriberTopic extends ServiceQueueTopic {
-  maxDeliveries?: number;
-  maxConcurrency?: number;
-}
-
 export interface DevSidecarBase {
   name: string;
   workspace: string;
@@ -494,7 +489,7 @@ export interface DevSidecarBase {
 export interface DevSubscriber extends DevSidecarBase {
   type: 'subscriber';
   consumer: string;
-  topics: string[] | DevSubscriberTopic[];
+  topics: ServiceTopics;
 }
 
 export interface DevCron extends DevSidecarBase {
