@@ -1,5 +1,11 @@
 import { spawn } from 'child_process';
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
+import {
+  existsSync,
+  readFileSync,
+  readdirSync,
+  writeFileSync,
+  mkdirSync,
+} from 'fs';
 import { join, delimiter, dirname, basename } from 'path';
 import type { ChildProcess } from 'child_process';
 import type { PythonFramework, StartDevServer } from '@vercel/build-utils';
@@ -336,8 +342,9 @@ async function runSync({
   });
 }
 
-// Reuse injected packages by target, package, and source so services sharing a
-// workspace never mutate the same install concurrently or reinstall it later.
+// Services in one workspace share this install target. Besides deduplicating
+// concurrent installs, remember successful installs for the dev session so a
+// later service does not rewrite site-packages underneath running workers.
 const PENDING_INSTALLS = new Map<string, Promise<void>>();
 const COMPLETED_INSTALLS = new Set<string>();
 
@@ -345,6 +352,17 @@ interface InjectedPackageSpec {
   name: 'vercel-runtime' | 'vercel-workers';
   pinnedVersion: string;
   envOverride: string | undefined;
+}
+
+function hasInstalledDistribution(targetDir: string, packageName: string) {
+  const prefix = `${packageName.replace('-', '_')}-`;
+  try {
+    return readdirSync(targetDir).some(
+      entry => entry.startsWith(prefix) && entry.endsWith('.dist-info')
+    );
+  } catch {
+    return false;
+  }
 }
 
 async function installInjectedDevPackage(
@@ -355,10 +373,13 @@ async function installInjectedDevPackage(
   const source = pkg.envOverride || pkg.pinnedVersion;
   const key = `${targetDir}:${pkg.name}:${source}`;
 
-  if (COMPLETED_INSTALLS.has(key)) {
-    debug(`${pkg.name} is already installed for this dev session, skipping`);
+  if (
+    COMPLETED_INSTALLS.has(key) &&
+    hasInstalledDistribution(targetDir, pkg.name)
+  ) {
     return;
   }
+  COMPLETED_INSTALLS.delete(key);
 
   await dedupePendingOperation(PENDING_INSTALLS, key, async () => {
     await doInstallInjectedDevPackage(pkg, { ...opts, targetDir });
@@ -382,8 +403,7 @@ async function doInstallInjectedDevPackage(
     (isLocalDev ? localDir : `${pkg.name}==${pkg.pinnedVersion}`);
 
   // Skip install if the exact pypi version is already present. Local dev
-  // builds and overrides reinstall once per dev session so source changes are
-  // picked up without racing sibling services.
+  // builds and overrides always reinstall to pick up possible source changes.
   if (!isLocalDev && !pkg.envOverride) {
     const distInfoName = pkg.name.replace('-', '_');
     const distInfo = join(

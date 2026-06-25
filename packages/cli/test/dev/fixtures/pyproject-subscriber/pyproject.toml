@@ -8,15 +8,16 @@ dependencies = [
 ]
 
 [tool.setuptools]
-packages = ["subscriber_a", "subscriber_b"]
+packages = ["worker_a"]
+py-modules = ["main", "worker_b", "worker_result"]
 
 [tool.vercel]
 entrypoint = "main:app"
 
-[tool.vercel.subscribers.high-priority-subscriber]
-entrypoint = "subscriber_a:app"
+[tool.vercel.subscribers.high-priority-worker]
+entrypoint = "worker_a:app"
 topics = ["high-priority"]
 
-[tool.vercel.subscribers.low-priority-subscriber]
-entrypoint = "subscriber_b:app"
+[tool.vercel.subscribers.low-priority-worker]
+entrypoint = "worker_b:app"
 topics = ["low-priority"]

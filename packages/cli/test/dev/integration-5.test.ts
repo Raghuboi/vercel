@@ -983,14 +983,14 @@ describe('[vercel dev] Pyproject queue subscribers', () => {
     await fs.remove(resultsDir);
   });
 
-  test('[vercel dev] Celery tasks trigger package-based pyproject subscribers', async () => {
+  test('[vercel dev] Celery tasks trigger pyproject subscribers', async () => {
     const dir = fixture('pyproject-subscriber');
     const { dev, port, readyResolver } = await testFixture(
       dir,
       {
         skipNpmInstall: true,
-        // Both implicit subscribers share the fixture's managed venv. An
-        // unrelated activated venv must not trigger the multi-service guard.
+        // Both workers share one managed environment; an unrelated activated
+        // environment must not trip the multi-workspace guard.
         env: {
           VIRTUAL_ENV: join(process.cwd(), '.external-test-venv'),
         },

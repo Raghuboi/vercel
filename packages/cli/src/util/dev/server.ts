@@ -100,7 +100,7 @@ import { ServicesOrchestrator } from './services-orchestrator';
 import { QueueBroker } from './queue-broker';
 import {
   collectBuilderDevSidecars,
-  toOrchestratorSubscriber,
+  toOrchestratorService,
 } from './dev-sidecars';
 import { injectNextDevWebSocketShimIfNeeded } from './next-dev-websocket-shim-injection';
 import { applyOverriddenHeaders, nodeHeadersToFetchHeaders } from './headers';
@@ -196,8 +196,7 @@ export default class DevServer {
   private orchestrator?: ServicesOrchestrator;
   private sidecarOrchestrator?: ServicesOrchestrator;
   private queueBroker?: QueueBroker;
-  private filteredSidecarBuilds: Builder[];
-  private sidecars: DevSidecar[] = [];
+  private sidecars?: DevSidecar[];
   private serviceRoutesTable?: Map<string, Route[]>;
 
   private vercelConfigWarning: boolean;
@@ -215,7 +214,9 @@ export default class DevServer {
   }
 
   private hasSubscribers(): boolean {
-    return this.sidecars.length > 0;
+    return Boolean(
+      this.sidecars?.some(sidecar => sidecar.type === 'subscriber')
+    );
   }
 
   private getDevQueueEnv(): Record<string, string> {
@@ -230,7 +231,7 @@ export default class DevServer {
   private getSidecarDevMeta(match: BuildMatch): {
     serviceCount?: number;
   } {
-    const serviceCount = this.sidecars.filter(sidecar => {
+    const serviceCount = (this.sidecars ?? []).filter(sidecar => {
       if (sidecar.builder.use !== match.use) return false;
       return !sidecar.workspace || sidecar.workspace === '.';
     }).length;
@@ -238,30 +239,26 @@ export default class DevServer {
     return serviceCount > 0 ? { serviceCount } : {};
   }
 
-  private async setupBuilderDevSidecars(
-    buildMatches: Iterable<BuildMatch>
-  ): Promise<void> {
+  private async setupBuilderDevSidecars(): Promise<void> {
     if (this.shouldUseServicesOrchestrator()) {
       return;
     }
 
     // Sidecar topology is resolved once at startup, like configured services;
     // the individual service dev servers remain responsible for source reloads.
-    const sidecars = await collectBuilderDevSidecars({
-      buildMatches,
-      workPath: this.cwd,
-    });
+    const sidecars = this.sidecars ?? [];
     if (sidecars.length === 0) {
       return;
     }
-    this.sidecars = sidecars;
 
-    Object.assign(this.envConfigs.runEnv, this.getDevQueueEnv());
+    if (this.hasSubscribers()) {
+      Object.assign(this.envConfigs.runEnv, this.getDevQueueEnv());
+    }
 
-    const subscribers = sidecars.map(toOrchestratorSubscriber);
+    const services = sidecars.map(toOrchestratorService);
 
     const orchestrator = new ServicesOrchestrator({
-      services: subscribers,
+      services,
       cwd: this.cwd,
       repoRoot: this.repoRoot,
       env: this.envConfigs.allEnv,
@@ -269,11 +266,11 @@ export default class DevServer {
       useImplicitEnvInjection: false,
       preferServiceBuilder: true,
     });
-    this.sidecarOrchestrator = orchestrator;
 
-    const queueBroker = new QueueBroker(subscribers, name =>
-      orchestrator.getServiceOrigin(name)
-    );
+    const queueBroker = this.hasSubscribers()
+      ? new QueueBroker(services, name => orchestrator.getServiceOrigin(name))
+      : undefined;
+    this.sidecarOrchestrator = orchestrator;
     this.queueBroker = queueBroker;
 
     try {
@@ -306,7 +303,6 @@ export default class DevServer {
     this.originalProjectSettings = options.projectSettings;
     this.projectSettings = options.projectSettings;
     this.services = options.services;
-    this.filteredSidecarBuilds = [];
     this.useImplicitServicesEnvInjection =
       options.useImplicitServicesEnvInjection ?? true;
     this.caseSensitive = false;
@@ -553,7 +549,7 @@ export default class DevServer {
   async updateBuildMatches(
     vercelConfig: VercelConfig,
     isInitial = false
-  ): Promise<BuildMatch[]> {
+  ): Promise<void> {
     const fileList = this.resolveBuildFiles(this.files);
     const matches = await getBuildMatches(
       vercelConfig,
@@ -561,18 +557,6 @@ export default class DevServer {
       this,
       fileList
     );
-    const filteredMatches =
-      isInitial && this.filteredSidecarBuilds.length > 0
-        ? await getBuildMatches(
-            {
-              ...vercelConfig,
-              builds: this.filteredSidecarBuilds,
-            },
-            this.cwd,
-            this,
-            fileList
-          )
-        : [];
     const sources = matches.map(m => m.src);
 
     if (isInitial && fileList.length === 0) {
@@ -642,8 +626,6 @@ export default class DevServer {
         return sortBuilders(matchA[1] as Builder, matchB[1] as Builder);
       })
     );
-
-    return [...matches, ...filteredMatches];
   }
 
   async getLocalEnv(fileName: string, base?: Env): Promise<Env> {
@@ -730,8 +712,6 @@ export default class DevServer {
       this.readJsonFile<PackageJson>('package.json'),
       this.readJsonFile<VercelConfig>(configPath),
     ]);
-
-    this.filteredSidecarBuilds = [];
 
     await this.validateVercelConfig(vercelConfig);
 
@@ -825,12 +805,16 @@ export default class DevServer {
       vercelConfig.routes = routes;
     }
 
+    if (this.sidecars === undefined) {
+      this.sidecars = this.shouldUseServicesOrchestrator()
+        ? []
+        : await collectBuilderDevSidecars({
+            builds: vercelConfig.builds ?? [],
+            workPath: this.cwd,
+          });
+    }
+
     if (Array.isArray(vercelConfig.builds)) {
-      if (this.devCommand) {
-        this.filteredSidecarBuilds = vercelConfig.builds.filter(
-          build => !filterFrontendBuilds(build)
-        );
-      }
       if (this.devCommand || (this.services && this.services.length > 0)) {
         vercelConfig.builds = vercelConfig.builds.filter(filterFrontendBuilds);
       }
@@ -1167,12 +1151,9 @@ export default class DevServer {
       }
     }
 
-    const sidecarBuildMatches = await this.updateBuildMatches(
-      vercelConfig,
-      true
-    );
+    await this.updateBuildMatches(vercelConfig, true);
 
-    await this.setupBuilderDevSidecars(sidecarBuildMatches);
+    await this.setupBuilderDevSidecars();
 
     if (!this.shouldUseServicesOrchestrator()) {
       devCommandPromise = this.runDevCommand();

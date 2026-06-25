@@ -5,7 +5,6 @@ import {
   QueueBroker,
   topicPatternToRegex,
 } from '../../../../src/util/dev/queue-broker';
-import { toOrchestratorSubscriber } from '../../../../src/util/dev/dev-sidecars';
 
 vi.mock('../../../../src/output-manager', () => ({
   default: { debug: vi.fn(), debugEnabled: false },
@@ -20,7 +19,7 @@ const mockFetch = vi.mocked(nodeFetch);
 
 function makeWorkerService(
   name: string,
-  topics: string[] = ['default']
+  topics: DevSubscriber['topics'] = ['default']
 ): ExperimentalService {
   return {
     schema: 'experimentalServices',
@@ -32,19 +31,23 @@ function makeWorkerService(
   } as ExperimentalService;
 }
 
-function makeSubscriber(
+function makeQueueJobService(
   name: string,
-  topics: NonNullable<DevSubscriber['topics']>,
-  consumer: string = name
-) {
-  return toOrchestratorSubscriber({
+  topics: Array<{
+    topic: string;
+    retryAfterSeconds?: number;
+    initialDelaySeconds?: number;
+  }>
+): ExperimentalService {
+  return {
+    schema: 'experimentalServices',
     name,
-    type: 'subscriber',
-    consumer,
+    type: 'job',
+    trigger: 'queue',
     workspace: '.',
     builder: { src: 'index.ts', use: '@vercel/node' },
     topics,
-  });
+  } as ExperimentalService;
 }
 
 function makeWebService(name: string): ExperimentalService {
@@ -131,13 +134,19 @@ describe('QueueBroker', () => {
       () =>
         new QueueBroker(
           [
-            makeSubscriber('subscriber-a', ['tasks'], 'shared-consumer'),
-            makeSubscriber('subscriber-b', ['tasks'], 'shared-consumer'),
+            {
+              ...makeWorkerService('worker-a', ['jobs']),
+              consumer: 'shared-consumer',
+            },
+            {
+              ...makeWorkerService('worker-b', ['jobs']),
+              consumer: 'shared-consumer',
+            },
           ],
           getServiceOrigin
         )
     ).toThrow(
-      'Queue consumer "shared-consumer" is configured more than once for topic "tasks"'
+      'Queue consumer "shared-consumer" is configured more than once for topic "jobs"'
     );
   });
 
@@ -189,6 +198,24 @@ describe('QueueBroker', () => {
       expect(headers['ce-vqsmessageid']).toBe(messageId);
       expect(headers['ce-vqsreceipthandle']).toBeTruthy();
       expect(headers['content-type']).toBe('application/json');
+    });
+
+    it('routes by service name while identifying its queue consumer', async () => {
+      broker = new QueueBroker(
+        [
+          {
+            ...makeWorkerService('celery-worker', ['tasks']),
+            consumer: 'celery-consumer',
+          },
+        ],
+        getServiceOrigin
+      );
+
+      broker.enqueue('tasks', Buffer.from('{}'), 'application/json');
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(getServiceOrigin).toHaveBeenCalledWith('celery-worker');
+      expect(callHeaders()['ce-vqsconsumergroup']).toBe('celery-consumer');
     });
 
     it('dispatches to multiple matching consumer groups', async () => {
@@ -284,10 +311,10 @@ describe('QueueBroker', () => {
       expect(mockFetch).not.toHaveBeenCalled();
     });
 
-    it('respects subscriber topic timing config', async () => {
+    it('dispatches queue-triggered job services and respects topic timing config', async () => {
       broker = new QueueBroker(
         [
-          makeSubscriber('processor', [
+          makeQueueJobService('processor', [
             {
               topic: 'orders',
               retryAfterSeconds: 30,
@@ -307,75 +334,43 @@ describe('QueueBroker', () => {
       expect(callHeaders()['ce-vqsconsumergroup']).toBe('processor');
     });
 
-    it('uses the consumer while routing to the subscriber name', async () => {
-      broker = new QueueBroker(
-        [
-          makeSubscriber(
-            'celery-subscriber',
-            ['tasks-topic'],
-            'celery-consumer'
-          ),
-        ],
-        getServiceOrigin
-      );
-
-      broker.enqueue('tasks-topic', Buffer.from('{}'), 'application/json');
-      await vi.advanceTimersByTimeAsync(0);
-
-      expect(getServiceOrigin).toHaveBeenCalledWith('celery-subscriber');
-      expect(callHeaders()['ce-vqsconsumergroup']).toBe('celery-consumer');
-    });
-
-    it('honors maxConcurrency across every topic for a consumer', async () => {
-      let resolveFirstRequest!: (response: {
+    it("honors maxConcurrency across a consumer's topics", async () => {
+      let resolveFirstRequest!: (value: {
         ok: boolean;
         status: number;
       }) => void;
-      const firstRequest = new Promise<{ ok: boolean; status: number }>(
-        resolve => {
-          resolveFirstRequest = resolve;
-        }
+      mockFetch.mockImplementationOnce(
+        () =>
+          new Promise(resolve => {
+            resolveFirstRequest = resolve;
+          }) as any
       );
-      mockFetch.mockImplementationOnce(() => firstRequest as any);
-
       broker = new QueueBroker(
         [
-          makeSubscriber('processor', [
-            {
-              topic: 'orders',
-              maxConcurrency: 1,
-            },
-            {
-              topic: 'events',
-              maxConcurrency: 1,
-            },
+          makeWorkerService('processor', [
+            { topic: 'orders', maxConcurrency: 1 },
+            { topic: 'events', maxConcurrency: 1 },
           ]),
         ],
         getServiceOrigin
       );
 
-      broker.enqueue('orders', Buffer.from('{"id":1}'), 'application/json');
-      broker.enqueue('events', Buffer.from('{"id":2}'), 'application/json');
+      broker.enqueue('orders', Buffer.from('{}'), 'application/json');
+      broker.enqueue('events', Buffer.from('{}'), 'application/json');
       await vi.advanceTimersByTimeAsync(0);
-
       expect(mockFetch).toHaveBeenCalledOnce();
 
       resolveFirstRequest({ ok: true, status: 200 });
       await vi.advanceTimersByTimeAsync(1_000);
-
       expect(mockFetch).toHaveBeenCalledTimes(2);
     });
 
-    it('honors configured maxDeliveries', async () => {
+    it('honors maxDeliveries', async () => {
       mockFetch.mockResolvedValue({ ok: false, status: 500 } as any);
       broker = new QueueBroker(
         [
-          makeSubscriber('processor', [
-            {
-              topic: 'orders',
-              retryAfterSeconds: 1,
-              maxDeliveries: 1,
-            },
+          makeWorkerService('processor', [
+            { topic: 'orders', retryAfterSeconds: 1, maxDeliveries: 1 },
           ]),
         ],
         getServiceOrigin
@@ -386,10 +381,8 @@ describe('QueueBroker', () => {
         Buffer.from('{}'),
         'application/json'
       );
-      await vi.advanceTimersByTimeAsync(0);
-      expect(mockFetch).toHaveBeenCalledOnce();
-
       await vi.advanceTimersByTimeAsync(1_000);
+
       expect(mockFetch).toHaveBeenCalledOnce();
       expect(broker.receiveById(messageId, 'processor')).toBeNull();
     });
@@ -473,13 +466,7 @@ describe('QueueBroker', () => {
   describe('receiveMessages', () => {
     it('selects the matching topic for a multi-topic consumer', () => {
       broker = new QueueBroker(
-        [
-          makeSubscriber(
-            'multi-subscriber',
-            ['orders', 'events'],
-            'shared-consumer'
-          ),
-        ],
+        [makeWorkerService('multi-worker', ['orders', 'events'])],
         getServiceOrigin
       );
 
@@ -488,7 +475,7 @@ describe('QueueBroker', () => {
       });
       vi.setSystemTime(Date.now() + 2_000);
 
-      const messages = broker.receiveMessages('events', 'shared-consumer');
+      const messages = broker.receiveMessages('events', 'multi-worker');
       expect(messages).toHaveLength(1);
       expect(messages[0].payload.toString()).toBe('{"kind":"event"}');
       expect(mockFetch).not.toHaveBeenCalled();

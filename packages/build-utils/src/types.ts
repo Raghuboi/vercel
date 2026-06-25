@@ -483,18 +483,26 @@ export interface DevSubscriberTopic extends ServiceQueueTopic {
   maxConcurrency?: number;
 }
 
-export interface DevSubscriber {
-  type: 'subscriber';
+export interface DevSidecarBase {
   name: string;
-  consumer: string;
   workspace: string;
   framework?: string;
   runtime?: string;
   builder: Builder;
+}
+
+export interface DevSubscriber extends DevSidecarBase {
+  type: 'subscriber';
+  consumer: string;
   topics: string[] | DevSubscriberTopic[];
 }
 
-export type DevSidecar = DevSubscriber;
+export interface DevCron extends DevSidecarBase {
+  type: 'cron';
+  schedule: string | string[];
+}
+
+export type DevSidecar = DevSubscriber | DevCron;
 
 /** Returns additional processes that a builder needs alongside its primary dev server. */
 export type GetDevSidecars = (

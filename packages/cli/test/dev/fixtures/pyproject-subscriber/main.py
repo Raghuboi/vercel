@@ -1,12 +1,12 @@
 from fastapi import FastAPI
 
-from subscriber_a import (  # pyright: ignore[reportImplicitRelativeImport]
-    QUEUE_NAME as HIGH_PRIORITY_QUEUE,
-    process_job as process_high_priority_job,
+from worker_a import (  # pyright: ignore[reportImplicitRelativeImport]
+    QUEUE_NAME as HIGH_QUEUE,
+    process_job as process_high,
 )
-from subscriber_b import (  # pyright: ignore[reportImplicitRelativeImport]
-    QUEUE_NAME as LOW_PRIORITY_QUEUE,
-    process_job as process_low_priority_job,
+from worker_b import (  # pyright: ignore[reportImplicitRelativeImport]
+    QUEUE_NAME as LOW_QUEUE,
+    process_job as process_low,
 )
 
 
@@ -15,14 +15,6 @@ app = FastAPI()
 
 @app.post("/enqueue")
 def enqueue():
-    high_request_id = "dev-celery-high"
-    low_request_id = "dev-celery-low"
-    process_high_priority_job.apply_async(
-        args=(high_request_id, 19, 23),
-        queue=HIGH_PRIORITY_QUEUE,
-    )
-    process_low_priority_job.apply_async(
-        args=(low_request_id, 20, 22),
-        queue=LOW_PRIORITY_QUEUE,
-    )
+    process_high.apply_async(args=("dev-celery-high", 19, 23), queue=HIGH_QUEUE)
+    process_low.apply_async(args=("dev-celery-low", 20, 22), queue=LOW_QUEUE)
     return {"enqueued": True}

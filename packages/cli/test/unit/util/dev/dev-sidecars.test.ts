@@ -1,8 +1,15 @@
-import { describe, expect, it, vi } from 'vitest';
-import type { Builder, DevSubscriber } from '@vercel/build-utils';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { Builder, DevCron, DevSubscriber } from '@vercel/build-utils';
 import type { BuilderWithPkg } from '../../../../src/util/build/import-builders';
-import { collectBuilderDevSidecars } from '../../../../src/util/dev/dev-sidecars';
-import type { BuildMatch } from '../../../../src/util/dev/types';
+import { importBuilders } from '../../../../src/util/build/import-builders';
+import {
+  collectBuilderDevSidecars,
+  toOrchestratorService,
+} from '../../../../src/util/dev/dev-sidecars';
+
+vi.mock('../../../../src/util/build/import-builders', () => ({
+  importBuilders: vi.fn(),
+}));
 
 const build: Builder = {
   use: '@vercel/example-runtime',
@@ -11,21 +18,27 @@ const build: Builder = {
 };
 
 const sidecar: DevSubscriber = {
-  name: 'background-subscriber',
   type: 'subscriber',
+  name: 'background-subscriber',
   consumer: 'background-consumer',
   workspace: '.',
   runtime: 'example',
-  builder: {
-    use: build.use,
-    src: 'subscriber.ts',
-  },
-  topics: [{ topic: 'jobs' }],
+  builder: { use: build.use, src: 'worker.ts' },
+  topics: ['jobs'],
+};
+
+const cron: DevCron = {
+  type: 'cron',
+  name: 'cleanup',
+  workspace: '.',
+  runtime: 'example',
+  builder: { use: build.use, src: 'cleanup.ts' },
+  schedule: '0 0 * * *',
 };
 
 function makeBuilderWithPkg(
   packageName: string,
-  getDevSidecars?: ReturnType<typeof vi.fn>
+  getDevSidecars: ReturnType<typeof vi.fn>
 ): BuilderWithPkg {
   return {
     path: '',
@@ -33,77 +46,44 @@ function makeBuilderWithPkg(
     dynamicallyInstalled: false,
     pkg: { name: packageName },
     builder: {
-      version: -1 as const,
+      version: -1,
       build: vi.fn(),
       getDevSidecars,
     },
   } as unknown as BuilderWithPkg;
 }
 
-function makeBuildMatch(
-  builderWithPkg: BuilderWithPkg,
-  buildConfig: Builder = build
-): BuildMatch {
-  return {
-    ...buildConfig,
-    buildConfig,
-    entrypoint: '<detect>',
-    builderWithPkg,
-  } as unknown as BuildMatch;
-}
+describe('builder development sidecars', () => {
+  beforeEach(() => {
+    vi.mocked(importBuilders).mockReset();
+  });
 
-describe('collectBuilderDevSidecars', () => {
-  it('collects sidecars from any builder that implements getDevSidecars', async () => {
+  it('collects sidecars from the original build configuration', async () => {
     const getDevSidecars = vi.fn().mockResolvedValue([sidecar]);
-    const builderWithPkg = makeBuilderWithPkg(build.use, getDevSidecars);
+    vi.mocked(importBuilders).mockResolvedValue(
+      new Map([[build.use, makeBuilderWithPkg(build.use, getDevSidecars)]])
+    );
 
     await expect(
-      collectBuilderDevSidecars({
-        buildMatches: [makeBuildMatch(builderWithPkg)],
-        workPath: '/project',
-      })
+      collectBuilderDevSidecars({ builds: [build], workPath: '/project' })
     ).resolves.toEqual([sidecar]);
 
+    expect(getDevSidecars).toHaveBeenCalledOnce();
     expect(getDevSidecars).toHaveBeenCalledWith({
       workPath: '/project',
       build,
     });
   });
 
-  it('invokes each contributing build configuration once', async () => {
+  it('rejects duplicate sidecar names from build configurations', async () => {
     const getDevSidecars = vi.fn().mockResolvedValue([sidecar]);
-    const builderWithPkg = makeBuilderWithPkg(build.use, getDevSidecars);
-
-    await expect(
-      collectBuilderDevSidecars({
-        buildMatches: [
-          makeBuildMatch(builderWithPkg),
-          makeBuildMatch(builderWithPkg),
-        ],
-        workPath: '/project',
-      })
-    ).resolves.toEqual([sidecar]);
-
-    expect(getDevSidecars).toHaveBeenCalledOnce();
-  });
-
-  it('rejects duplicate contributed sidecar names', async () => {
-    const duplicateBuild = { ...build, use: '@vercel/other-runtime' };
-    const first = makeBuilderWithPkg(
-      build.use,
-      vi.fn().mockResolvedValue([sidecar])
-    );
-    const second = makeBuilderWithPkg(
-      duplicateBuild.use,
-      vi.fn().mockResolvedValue([sidecar])
+    vi.mocked(importBuilders).mockResolvedValue(
+      new Map([[build.use, makeBuilderWithPkg(build.use, getDevSidecars)]])
     );
 
     await expect(
       collectBuilderDevSidecars({
-        buildMatches: [
-          makeBuildMatch(first),
-          makeBuildMatch(second, duplicateBuild),
-        ],
+        builds: [build, build],
         workPath: '/project',
       })
     ).rejects.toThrow(
@@ -115,16 +95,34 @@ describe('collectBuilderDevSidecars', () => {
     const getDevSidecars = vi
       .fn()
       .mockResolvedValue([{ ...sidecar, type: 'web' }]);
+    vi.mocked(importBuilders).mockResolvedValue(
+      new Map([[build.use, makeBuilderWithPkg(build.use, getDevSidecars)]])
+    );
 
     await expect(
-      collectBuilderDevSidecars({
-        buildMatches: [
-          makeBuildMatch(makeBuilderWithPkg(build.use, getDevSidecars)),
-        ],
-        workPath: '/project',
-      })
+      collectBuilderDevSidecars({ builds: [build], workPath: '/project' })
     ).rejects.toThrow(
-      'Development sidecar "background-subscriber" must be a subscriber'
+      'Development sidecar "background-subscriber" has unsupported type "web"'
     );
+  });
+
+  it('adapts subscribers without conflating their process and consumer names', () => {
+    expect(toOrchestratorService(sidecar)).toMatchObject({
+      schema: 'experimentalServices',
+      name: 'background-subscriber',
+      consumer: 'background-consumer',
+      type: 'worker',
+      trigger: 'queue',
+      topics: ['jobs'],
+    });
+  });
+
+  it('adapts cron sidecars to cron services', () => {
+    expect(toOrchestratorService(cron)).toMatchObject({
+      schema: 'experimentalServices',
+      name: 'cleanup',
+      type: 'cron',
+      schedule: '0 0 * * *',
+    });
   });
 });

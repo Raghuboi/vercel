@@ -49,8 +49,6 @@ export interface EnvConfigs {
 }
 
 export interface BuildMatch extends BuildConfig {
-  /** Original build configuration before its source pattern was expanded. */
-  buildConfig: BuildConfig;
   entrypoint: string;
   src: string;
   builderWithPkg: BuilderWithPkg;

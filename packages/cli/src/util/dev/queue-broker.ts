@@ -80,6 +80,8 @@ export interface EnqueueOptions {
   delaySeconds?: number;
 }
 
+type QueueBrokerService = ExperimentalService & { consumer?: string };
+
 export class QueueBroker {
   private messages = new Map<string, StoredMessage>();
   private consumerGroups: ConsumerGroup[] = [];
@@ -87,7 +89,7 @@ export class QueueBroker {
   private tickTimer: ReturnType<typeof setInterval>;
 
   constructor(
-    services: ExperimentalService[],
+    services: QueueBrokerService[],
     private getServiceOrigin: (name: string) => string | null
   ) {
     const consumerConcurrency = new Map<string, ConsumerConcurrency>();
@@ -95,14 +97,9 @@ export class QueueBroker {
     for (const service of services) {
       if (!isQueueBackedService(service)) continue;
 
-      const topicConfigs = getServiceQueueTopicConfigs(
-        service
-      ) as DevSubscriberTopic[];
-      const consumer =
-        'consumer' in service && typeof service.consumer === 'string'
-          ? service.consumer
-          : undefined;
-      const consumerGroup = consumer || service.name;
+      const topicConfigs: DevSubscriberTopic[] =
+        getServiceQueueTopicConfigs(service);
+      const consumerGroup = service.consumer ?? service.name;
       for (const topicConfig of topicConfigs) {
         const topicPattern = topicConfig.topic;
         const id = `${consumerGroup}::${topicPattern}`;
@@ -417,7 +414,7 @@ export class QueueBroker {
     ).toISOString();
 
     output.debug(
-      `queues: dispatching v2beta callback to subscriber "${group.name}" at ${upstream}`
+      `queues: dispatching v2beta callback to worker "${group.name}" at ${upstream}`
     );
 
     try {
@@ -444,7 +441,7 @@ export class QueueBroker {
 
       if (!response.ok) {
         output.debug(
-          `queues: subscriber "${group.name}" returned ${response.status} for message ${message.messageId}`
+          `queues: worker "${group.name}" returned ${response.status} for message ${message.messageId}`
         );
         this.handleDeliveryFailure(message.messageId, group);
       }
