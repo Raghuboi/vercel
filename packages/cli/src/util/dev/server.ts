@@ -429,7 +429,6 @@ export default class DevServer {
 
     // Update the build matches in case an entrypoint was created or deleted
     await this.updateBuildMatches(vercelConfig);
-    await this.runDevCommand();
 
     const filesChangedArray = [...filesChanged];
     const filesRemovedArray = [...filesRemoved];
@@ -928,6 +927,12 @@ export default class DevServer {
     }
 
     this.envConfigs = { buildEnv, runEnv, allEnv };
+
+    // Preserve config-driven dev command restarts. Subscriber projects only
+    // defer the initial start until their sidecars are ready.
+    if (!this.hasSubscribers() || this.sidecarOrchestrator) {
+      await this.runDevCommand();
+    }
 
     return vercelConfig;
   }
