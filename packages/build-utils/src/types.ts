@@ -487,26 +487,18 @@ export interface GetDevSidecarsOptions {
   build: Builder;
 }
 
-export interface DevSidecarBase {
+export interface DevSubscriber {
+  type: 'subscriber';
   name: string;
+  consumer: string;
   workspace: string;
   framework?: string;
   runtime?: string;
   builder: Builder;
-}
-
-export interface DevSubscriber extends DevSidecarBase {
-  type: 'subscriber';
-  consumer: string;
   topics: ServiceTopics;
 }
 
-export interface DevCron extends DevSidecarBase {
-  type: 'cron';
-  schedule: string | string[];
-}
-
-export type DevSidecar = DevSubscriber | DevCron;
+export type DevSidecar = DevSubscriber;
 
 /** Returns additional processes that a builder needs alongside its primary dev server. */
 export type GetDevSidecars = (

@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Builder, DevCron, DevSubscriber } from '@vercel/build-utils';
+import type { Builder, DevSubscriber } from '@vercel/build-utils';
 import type { BuilderWithPkg } from '../../../../src/util/build/import-builders';
 import { importBuilders } from '../../../../src/util/build/import-builders';
 import {
@@ -25,15 +25,6 @@ const sidecar: DevSubscriber = {
   runtime: 'example',
   builder: { use: build.use, src: 'worker.ts' },
   topics: ['jobs'],
-};
-
-const cron: DevCron = {
-  type: 'cron',
-  name: 'cleanup',
-  workspace: '.',
-  runtime: 'example',
-  builder: { use: build.use, src: 'cleanup.ts' },
-  schedule: '0 0 * * *',
 };
 
 function makeBuilderWithPkg(
@@ -114,15 +105,6 @@ describe('builder development sidecars', () => {
       type: 'worker',
       trigger: 'queue',
       topics: ['jobs'],
-    });
-  });
-
-  it('adapts cron sidecars to cron services', () => {
-    expect(toOrchestratorService(cron)).toMatchObject({
-      schema: 'experimentalServices',
-      name: 'cleanup',
-      type: 'cron',
-      schedule: '0 0 * * *',
     });
   });
 });

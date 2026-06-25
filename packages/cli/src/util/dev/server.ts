@@ -225,9 +225,7 @@ export default class DevServer {
   }
 
   private hasSubscribers(): boolean {
-    return Boolean(
-      this.sidecars?.some(sidecar => sidecar.type === 'subscriber')
-    );
+    return Boolean(this.sidecars?.length);
   }
 
   private getDevQueueEnv(): Record<string, string> {
@@ -262,9 +260,7 @@ export default class DevServer {
       return;
     }
 
-    if (this.hasSubscribers()) {
-      Object.assign(this.envConfigs.runEnv, this.getDevQueueEnv());
-    }
+    Object.assign(this.envConfigs.runEnv, this.getDevQueueEnv());
 
     const services = sidecars.map(toOrchestratorService);
 
@@ -278,16 +274,16 @@ export default class DevServer {
       preferServiceBuilder: true,
     });
 
-    const queueBroker = this.hasSubscribers()
-      ? new QueueBroker(services, name => orchestrator.getServiceOrigin(name))
-      : undefined;
+    const queueBroker = new QueueBroker(services, name =>
+      orchestrator.getServiceOrigin(name)
+    );
     this.sidecarOrchestrator = orchestrator;
     this.queueBroker = queueBroker;
 
     try {
       await orchestrator.startAll();
     } catch (err) {
-      queueBroker?.stop();
+      queueBroker.stop();
       this.queueBroker = undefined;
       await orchestrator.stopAll();
       this.sidecarOrchestrator = undefined;

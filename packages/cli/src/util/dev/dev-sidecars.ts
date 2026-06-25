@@ -7,25 +7,13 @@ type OrchestratorSidecar = ExperimentalService & { consumer?: string };
 export function toOrchestratorService(
   sidecar: DevSidecar
 ): OrchestratorSidecar {
-  switch (sidecar.type) {
-    case 'subscriber': {
-      const { type: _type, ...subscriber } = sidecar;
-      return {
-        ...subscriber,
-        schema: 'experimentalServices',
-        type: 'worker',
-        trigger: 'queue',
-      };
-    }
-    case 'cron': {
-      const { type: _type, ...cron } = sidecar;
-      return {
-        ...cron,
-        schema: 'experimentalServices',
-        type: 'cron',
-      };
-    }
-  }
+  const { type: _type, ...subscriber } = sidecar;
+  return {
+    ...subscriber,
+    schema: 'experimentalServices',
+    type: 'worker',
+    trigger: 'queue',
+  };
 }
 
 export async function collectBuilderDevSidecars({
@@ -52,7 +40,7 @@ export async function collectBuilderDevSidecars({
   const names = new Set<string>();
   for (const sidecar of sidecars) {
     const { name, type } = sidecar as { name: string; type: string };
-    if (type !== 'subscriber' && type !== 'cron') {
+    if (type !== 'subscriber') {
       throw new Error(
         `Development sidecar "${name}" has unsupported type "${type}"`
       );
