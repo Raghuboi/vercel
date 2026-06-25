@@ -478,20 +478,25 @@ export interface GetDevSidecarsOptions {
   build: Builder;
 }
 
-export interface DevSidecarQueueTopic extends ServiceQueueTopic {
+export interface DevSubscriberTopic extends ServiceQueueTopic {
   maxDeliveries?: number;
   maxConcurrency?: number;
 }
 
-export type DevSidecarV1 = Omit<ExperimentalService, 'topics'> & {
-  /** Queue consumer identifier, distinct from service grouping. */
-  consumer?: string;
-  topics?: string[] | DevSidecarQueueTopic[];
-};
+export interface DevSubscriber {
+  type: 'subscriber';
+  name: string;
+  consumer: string;
+  workspace: string;
+  framework?: string;
+  runtime?: string;
+  builder: Builder;
+  topics: string[] | DevSubscriberTopic[];
+}
 
-export type DevSidecar = DevSidecarV1 | ExperimentalServiceV2;
+export type DevSidecar = DevSubscriber;
 
-/** Returns sidecar services that a builder needs alongside its primary dev server. */
+/** Returns additional processes that a builder needs alongside its primary dev server. */
 export type GetDevSidecars = (
   options: GetDevSidecarsOptions
 ) => Promise<DevSidecar[]>;

@@ -705,9 +705,7 @@ export class ServicesOrchestrator {
       rootPath: path.join(this.cwd, root),
       rootLabel: root,
       framework,
-      builderSpec: this.preferServiceBuilder
-        ? service.builder?.use || framework?.useRuntime?.use
-        : framework?.useRuntime?.use || service.builder?.use,
+      builderSpec: framework?.useRuntime?.use || service.builder?.use,
       entrypoint: getEntrypointForService(
         service.builder?.src,
         service.entrypoint,

@@ -83,7 +83,7 @@ interface Pyproject {
   };
 }
 
-export function safePathSegment(value: string): string {
+function safePathSegment(value: string): string {
   return [...value]
     .map(char => {
       if (char === '_') {

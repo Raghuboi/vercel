@@ -7,8 +7,7 @@ import type { ExperimentalService } from '@vercel/fs-detectors';
 import {
   getServiceQueueTopicConfigs,
   isQueueBackedService,
-  type DevSidecarQueueTopic,
-  type DevSidecarV1,
+  type DevSubscriberTopic,
 } from '@vercel/build-utils';
 import output from '../../output-manager';
 
@@ -88,7 +87,7 @@ export class QueueBroker {
   private tickTimer: ReturnType<typeof setInterval>;
 
   constructor(
-    services: Array<ExperimentalService | DevSidecarV1>,
+    services: ExperimentalService[],
     private getServiceOrigin: (name: string) => string | null
   ) {
     const consumerConcurrency = new Map<string, ConsumerConcurrency>();
@@ -98,7 +97,7 @@ export class QueueBroker {
 
       const topicConfigs = getServiceQueueTopicConfigs(
         service
-      ) as DevSidecarQueueTopic[];
+      ) as DevSubscriberTopic[];
       const consumer =
         'consumer' in service && typeof service.consumer === 'string'
           ? service.consumer
@@ -107,6 +106,11 @@ export class QueueBroker {
       for (const topicConfig of topicConfigs) {
         const topicPattern = topicConfig.topic;
         const id = `${consumerGroup}::${topicPattern}`;
+        if (this.deliveryState.has(id)) {
+          throw new Error(
+            `Queue consumer "${consumerGroup}" is configured more than once for topic "${topicPattern}"`
+          );
+        }
         const maxConcurrency =
           topicConfig.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY;
         let concurrency = consumerConcurrency.get(consumerGroup);
@@ -413,7 +417,7 @@ export class QueueBroker {
     ).toISOString();
 
     output.debug(
-      `queues: dispatching v2beta callback to worker "${group.name}" at ${upstream}`
+      `queues: dispatching v2beta callback to subscriber "${group.name}" at ${upstream}`
     );
 
     try {
@@ -440,7 +444,7 @@ export class QueueBroker {
 
       if (!response.ok) {
         output.debug(
-          `queues: worker "${group.name}" returned ${response.status} for message ${message.messageId}`
+          `queues: subscriber "${group.name}" returned ${response.status} for message ${message.messageId}`
         );
         this.handleDeliveryFailure(message.messageId, group);
       }

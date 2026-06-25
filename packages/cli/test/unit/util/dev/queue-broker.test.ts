@@ -1,9 +1,11 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import type { ExperimentalService } from '@vercel/fs-detectors';
+import type { DevSubscriber } from '@vercel/build-utils';
 import {
   QueueBroker,
   topicPatternToRegex,
 } from '../../../../src/util/dev/queue-broker';
+import { toOrchestratorSubscriber } from '../../../../src/util/dev/dev-sidecars';
 
 vi.mock('../../../../src/output-manager', () => ({
   default: { debug: vi.fn(), debugEnabled: false },
@@ -30,25 +32,19 @@ function makeWorkerService(
   } as ExperimentalService;
 }
 
-function makeQueueJobService(
+function makeSubscriber(
   name: string,
-  topics: Array<{
-    topic: string;
-    retryAfterSeconds?: number;
-    initialDelaySeconds?: number;
-    maxDeliveries?: number;
-    maxConcurrency?: number;
-  }>
-): ExperimentalService {
-  return {
-    schema: 'experimentalServices',
+  topics: NonNullable<DevSubscriber['topics']>,
+  consumer: string = name
+) {
+  return toOrchestratorSubscriber({
     name,
-    type: 'job',
-    trigger: 'queue',
+    type: 'subscriber',
+    consumer,
     workspace: '.',
     builder: { src: 'index.ts', use: '@vercel/node' },
     topics,
-  } as ExperimentalService;
+  });
 }
 
 function makeWebService(name: string): ExperimentalService {
@@ -128,6 +124,21 @@ describe('QueueBroker', () => {
   afterEach(() => {
     broker?.stop();
     vi.useRealTimers();
+  });
+
+  it('rejects duplicate consumer and topic pairs', () => {
+    expect(
+      () =>
+        new QueueBroker(
+          [
+            makeSubscriber('subscriber-a', ['tasks'], 'shared-consumer'),
+            makeSubscriber('subscriber-b', ['tasks'], 'shared-consumer'),
+          ],
+          getServiceOrigin
+        )
+    ).toThrow(
+      'Queue consumer "shared-consumer" is configured more than once for topic "tasks"'
+    );
   });
 
   describe('enqueue', () => {
@@ -273,10 +284,10 @@ describe('QueueBroker', () => {
       expect(mockFetch).not.toHaveBeenCalled();
     });
 
-    it('dispatches queue-triggered job services and respects topic timing config', async () => {
+    it('respects subscriber topic timing config', async () => {
       broker = new QueueBroker(
         [
-          makeQueueJobService('processor', [
+          makeSubscriber('processor', [
             {
               topic: 'orders',
               retryAfterSeconds: 30,
@@ -296,14 +307,14 @@ describe('QueueBroker', () => {
       expect(callHeaders()['ce-vqsconsumergroup']).toBe('processor');
     });
 
-    it('uses the queue consumer while routing to the service name', async () => {
+    it('uses the consumer while routing to the subscriber name', async () => {
       broker = new QueueBroker(
         [
-          {
-            ...makeWorkerService('celery-worker', ['tasks-topic']),
-            consumer: 'celery-consumer',
-            group: 'deployment-group',
-          },
+          makeSubscriber(
+            'celery-subscriber',
+            ['tasks-topic'],
+            'celery-consumer'
+          ),
         ],
         getServiceOrigin
       );
@@ -311,7 +322,7 @@ describe('QueueBroker', () => {
       broker.enqueue('tasks-topic', Buffer.from('{}'), 'application/json');
       await vi.advanceTimersByTimeAsync(0);
 
-      expect(getServiceOrigin).toHaveBeenCalledWith('celery-worker');
+      expect(getServiceOrigin).toHaveBeenCalledWith('celery-subscriber');
       expect(callHeaders()['ce-vqsconsumergroup']).toBe('celery-consumer');
     });
 
@@ -329,7 +340,7 @@ describe('QueueBroker', () => {
 
       broker = new QueueBroker(
         [
-          makeQueueJobService('processor', [
+          makeSubscriber('processor', [
             {
               topic: 'orders',
               maxConcurrency: 1,
@@ -359,7 +370,7 @@ describe('QueueBroker', () => {
       mockFetch.mockResolvedValue({ ok: false, status: 500 } as any);
       broker = new QueueBroker(
         [
-          makeQueueJobService('processor', [
+          makeSubscriber('processor', [
             {
               topic: 'orders',
               retryAfterSeconds: 1,
@@ -463,10 +474,11 @@ describe('QueueBroker', () => {
     it('selects the matching topic for a multi-topic consumer', () => {
       broker = new QueueBroker(
         [
-          {
-            ...makeWorkerService('multi-worker', ['orders', 'events']),
-            consumer: 'shared-consumer',
-          },
+          makeSubscriber(
+            'multi-subscriber',
+            ['orders', 'events'],
+            'shared-consumer'
+          ),
         ],
         getServiceOrigin
       );

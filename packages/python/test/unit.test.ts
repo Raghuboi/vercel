@@ -1941,8 +1941,8 @@ describe('entrypointToModule', () => {
       'backend.api.server'
     );
     expect(entrypointToModule('src/main.py')).toBe('src.main');
-    expect(entrypointToModule('workers/celery/__init__.py')).toBe(
-      'workers.celery'
+    expect(entrypointToModule('subscribers/celery/__init__.py')).toBe(
+      'subscribers.celery'
     );
   });
 
@@ -2277,11 +2277,11 @@ describe('pyproject subscribers', () => {
   });
 
   it('returns dev sidecars matching build consumer names', async () => {
-    const workerPackage = path.join(mockWorkPath, 'workers', 'celery');
-    fs.mkdirSync(workerPackage, { recursive: true });
+    const subscriberPackage = path.join(mockWorkPath, 'subscribers', 'celery');
+    fs.mkdirSync(subscriberPackage, { recursive: true });
     fs.writeFileSync(
-      path.join(workerPackage, '__init__.py'),
-      'from celery import Celery\napp = Celery("worker")\n'
+      path.join(subscriberPackage, '__init__.py'),
+      'from celery import Celery\napp = Celery("subscriber")\n'
     );
     fs.writeFileSync(
       path.join(mockWorkPath, 'pyproject.toml'),
@@ -2290,8 +2290,8 @@ describe('pyproject subscribers', () => {
         'name = "x"',
         'version = "0.0.1"',
         '',
-        '[tool.vercel.subscribers.celery-worker]',
-        'entrypoint = "workers.celery:app"',
+        '[tool.vercel.subscribers.celery-subscriber]',
+        'entrypoint = "subscribers.celery:app"',
         'topics = ["celery", "emails"]',
         'max_deliveries = 3',
         'retry_after_seconds = 10',
@@ -2312,19 +2312,17 @@ describe('pyproject subscribers', () => {
       })
     ).resolves.toEqual([
       {
-        schema: 'experimentalServices',
-        name: 'celery-worker',
-        type: 'worker',
-        trigger: 'queue',
+        name: 'celery-subscriber',
+        type: 'subscriber',
         consumer: sanitizeConsumerName(
-          getSubscriberOutputPath('celery-worker')
+          getSubscriberOutputPath('celery-subscriber')
         ),
         workspace: '.',
         framework: 'fastapi',
         runtime: 'python',
         builder: {
           use: '@vercel/python',
-          src: 'workers/celery/__init__.py',
+          src: 'subscribers/celery/__init__.py',
           config: {
             handlerFunction: 'app',
           },
@@ -2368,13 +2366,13 @@ describe('pyproject subscribers', () => {
     ).resolves.toEqual([]);
   });
 
-  it('emits one queue/v2beta worker lambda per subscriber with all topics attached', async () => {
+  it('emits one queue/v2beta Lambda per subscriber with all topics attached', async () => {
     const files = {
       'app.py': new FileBlob({
         data: 'def app(environ, start_response): pass\n',
       }),
-      'worker.py': new FileBlob({
-        data: 'from celery import Celery\napp = Celery("worker")\n',
+      'subscriber.py': new FileBlob({
+        data: 'from celery import Celery\napp = Celery("subscriber")\n',
       }),
       'pyproject.toml': new FileBlob({
         data: [
@@ -2382,8 +2380,8 @@ describe('pyproject subscribers', () => {
           'name = "x"',
           'version = "0.0.1"',
           '',
-          '[tool.vercel.subscribers.celery-worker]',
-          'entrypoint = "worker:app"',
+          '[tool.vercel.subscribers.celery-subscriber]',
+          'entrypoint = "subscriber:app"',
           'topics = ["celery", "emails"]',
           'max_deliveries = 3',
           'retry_after_seconds = 10',
@@ -2404,7 +2402,7 @@ describe('pyproject subscribers', () => {
     });
 
     const output = getBuildOutputV2(result).output as any;
-    const celeryPath = getSubscriberOutputPath('celery-worker');
+    const celeryPath = getSubscriberOutputPath('celery-subscriber');
     const consumer = sanitizeConsumerName(celeryPath);
 
     expect(output.index).toBeDefined();
@@ -2451,7 +2449,7 @@ describe('pyproject subscribers', () => {
       'app.py': new FileBlob({
         data: 'def app(environ, start_response): pass\n',
       }),
-      'worker.py': new FileBlob({
+      'subscriber.py': new FileBlob({
         data: 'app = object()\n',
       }),
       'pyproject.toml': new FileBlob({
@@ -2460,8 +2458,8 @@ describe('pyproject subscribers', () => {
           'name = "x"',
           'version = "0.0.1"',
           '',
-          '[tool.vercel.subscribers.worker]',
-          'entrypoint = "worker:app"',
+          '[tool.vercel.subscribers.subscriber]',
+          'entrypoint = "subscriber:app"',
           'topics = ["jobs"]',
           'consumer = "custom"',
           '',

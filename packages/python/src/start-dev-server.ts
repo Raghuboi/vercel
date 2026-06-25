@@ -133,7 +133,7 @@ interface DevPythonOptions {
   onStderr?: (buf: Buffer) => void;
 }
 
-function dedupePendingOperation<T>(
+async function dedupePendingOperation<T>(
   operations: Map<string, Promise<T>>,
   key: string,
   operation: () => Promise<T>
@@ -146,14 +146,13 @@ function dedupePendingOperation<T>(
   const pending = operation();
   operations.set(key, pending);
 
-  const cleanup = () => {
+  try {
+    return await pending;
+  } finally {
     if (operations.get(key) === pending) {
       operations.delete(key);
     }
-  };
-  void pending.then(cleanup, cleanup);
-
-  return pending;
+  }
 }
 
 // Multiple services in one workspace share a managed virtualenv and manifest.
@@ -382,9 +381,9 @@ async function doInstallInjectedDevPackage(
     pkg.envOverride ||
     (isLocalDev ? localDir : `${pkg.name}==${pkg.pinnedVersion}`);
 
-  // Skip install if the exact pypi version is already present;
-  // local dev builds and explicitly specified versions
-  // always reinstall to pick up possible source changes.
+  // Skip install if the exact pypi version is already present. Local dev
+  // builds and overrides reinstall once per dev session so source changes are
+  // picked up without racing sibling services.
   if (!isLocalDev && !pkg.envOverride) {
     const distInfoName = pkg.name.replace('-', '_');
     const distInfo = join(
@@ -689,8 +688,8 @@ export const startDevServer: StartDevServer = async opts => {
   const env = { ...process.env, ...(meta.env || {}) } as NodeJS.ProcessEnv;
   const entrypoint = rawEntrypoint === '<detect>' ? undefined : rawEntrypoint;
 
-  // For schedule-triggered job and worker services, use the raw entrypoint directly, because
-  // they don't export app/application so standard detection would skip them.
+  // For non-web background processes, use the raw entrypoint directly because
+  // they don't export app/application, so standard detection would skip them.
   let resolved: PythonEntrypoint | undefined;
   const handlerFunction =
     typeof config?.handlerFunction === 'string'

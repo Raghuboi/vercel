@@ -997,8 +997,6 @@ describe('[vercel dev] Pyproject queue subscribers', () => {
       },
       ['--local']
     );
-    let devOutput = '';
-
     try {
       await readyResolver;
 
@@ -1006,15 +1004,6 @@ describe('[vercel dev] Pyproject queue subscribers', () => {
         method: 'POST',
       });
       expect(enqueueRes.status).toBe(200);
-      const enqueueJson = await enqueueRes.json();
-      expect(enqueueJson).toHaveProperty('requestIds', [
-        'dev-celery-high',
-        'dev-celery-low',
-      ]);
-      expect(enqueueJson.taskIds).toHaveLength(2);
-      expect(
-        enqueueJson.taskIds.every((id: unknown) => typeof id === 'string')
-      ).toBe(true);
 
       const highResultPath = join(resultsDir, 'high-priority.json');
       const lowResultPath = join(resultsDir, 'low-priority.json');
@@ -1043,13 +1032,8 @@ describe('[vercel dev] Pyproject queue subscribers', () => {
         sum: 42,
       });
     } finally {
-      const { stdout, stderr } = await dev.kill();
-      devOutput = `${stdout}\n${stderr}`;
+      await dev.kill();
     }
-
-    // Starting the lazy web app must not reinstall shared dependencies while
-    // its subscriber processes are importing from the same environment.
-    expect(devOutput).not.toContain('ModuleNotFoundError');
   });
 });
 

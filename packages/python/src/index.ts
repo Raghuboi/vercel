@@ -25,7 +25,7 @@ import {
   type BuildOptions,
   type GlobOptions,
   type BuildVX,
-  type DevSidecar,
+  type DevSubscriber,
   type Files,
   type GetDevSidecarsOptions,
   type ShouldServe,
@@ -106,7 +106,7 @@ export const version = -1;
 export async function getDevSidecars({
   workPath,
   build,
-}: GetDevSidecarsOptions): Promise<DevSidecar[]> {
+}: GetDevSidecarsOptions): Promise<DevSubscriber[]> {
   const framework = build.config?.framework;
   if (
     build.config?.middleware === true ||
@@ -118,10 +118,8 @@ export async function getDevSidecars({
 
   const subscribers = await getPyprojectSubscribers(workPath);
   return subscribers.map(subscriber => ({
-    schema: 'experimentalServices',
+    type: 'subscriber',
     name: subscriber.name,
-    type: 'worker',
-    trigger: 'queue',
     consumer: getSubscriberConsumerName(subscriber.name),
     workspace: '.',
     framework,
@@ -520,13 +518,12 @@ export const build: BuildVX = async ({
     meta,
   });
 
-  // `tool.vercel.subscribers` declares background workers for a standalone
-  // Python app and compiles them into additional queue-triggered Lambdas.
+  // `tool.vercel.subscribers` declares queue subscribers for a standalone
+  // Python app and compiles them into additional Lambdas.
   // It is intentionally scoped to non-service framework builds:
-  //   - `experimentalServices` projects already declare queue consumers as
-  //     first-class `worker`/`job` services, so a second implicit mechanism
-  //     would be redundant and ambiguous (services can share one pyproject.toml,
-  //     which would duplicate every subscriber across each service build).
+  //   - Service projects already own their process topology, so an implicit
+  //     mechanism would be ambiguous (services can share one pyproject.toml,
+  //     which would duplicate subscribers across each service build).
   //   - Bare `api/**` functions build once per file sharing this workPath, so
   //     emitting subscribers there would duplicate their outputs per build.
   if (!service && isPythonFramework(framework)) {
@@ -1213,6 +1210,7 @@ export const build: BuildVX = async ({
       environment: {
         ...lambdaEnv,
         VERCEL_HAS_WORKER_SERVICES: '1',
+        // Compatibility marker consumed by the current Python runtime.
         VERCEL_SERVICE_TYPE: 'worker',
       },
       experimentalTriggers,

@@ -37,6 +37,7 @@ import {
 import {
   type Builder,
   cloneEnv,
+  type DevSidecar,
   type Env,
   getNodeBinPaths,
   isQueueBackedService,
@@ -97,7 +98,10 @@ import type { ProjectSettings } from '@vercel-internals/types';
 import { treeKill } from '../tree-kill';
 import { ServicesOrchestrator } from './services-orchestrator';
 import { QueueBroker } from './queue-broker';
-import { collectBuilderDevSidecars } from './dev-sidecars';
+import {
+  collectBuilderDevSidecars,
+  toOrchestratorSubscriber,
+} from './dev-sidecars';
 import { injectNextDevWebSocketShimIfNeeded } from './next-dev-websocket-shim-injection';
 import { applyOverriddenHeaders, nodeHeadersToFetchHeaders } from './headers';
 import { formatQueryString, parseQueryString } from './parse-query-string';
@@ -193,8 +197,7 @@ export default class DevServer {
   private sidecarOrchestrator?: ServicesOrchestrator;
   private queueBroker?: QueueBroker;
   private filteredSidecarBuilds: Builder[];
-  private sidecarBuildMatches: BuildMatch[];
-  private sidecars: Service[] = [];
+  private sidecars: DevSidecar[] = [];
   private serviceRoutesTable?: Map<string, Route[]>;
 
   private vercelConfigWarning: boolean;
@@ -211,22 +214,17 @@ export default class DevServer {
     return Boolean(this.services && this.services.length > 0);
   }
 
-  private hasQueueSidecars(): boolean {
-    return this.sidecars
-      .filter(isExperimentalService)
-      .some(isQueueBackedService);
+  private hasSubscribers(): boolean {
+    return this.sidecars.length > 0;
   }
 
   private getDevQueueEnv(): Record<string, string> {
     return {
+      // Existing vercel-runtime compatibility contract.
       VERCEL_HAS_WORKER_SERVICES: '1',
       VERCEL_QUEUE_BASE_URL: `${this.address.origin}/_svc/_queues`,
       VERCEL_QUEUE_TOKEN: 'vc-dev-token',
     };
-  }
-
-  private injectDevQueueEnv(): void {
-    Object.assign(this.envConfigs.runEnv, this.getDevQueueEnv());
   }
 
   private getSidecarDevMeta(match: BuildMatch): {
@@ -234,16 +232,15 @@ export default class DevServer {
   } {
     const serviceCount = this.sidecars.filter(sidecar => {
       if (sidecar.builder.use !== match.use) return false;
-      const workspace = isExperimentalService(sidecar)
-        ? sidecar.workspace
-        : sidecar.root;
-      return !workspace || workspace === '.';
+      return !sidecar.workspace || sidecar.workspace === '.';
     }).length;
 
     return serviceCount > 0 ? { serviceCount } : {};
   }
 
-  private async setupBuilderDevSidecars(): Promise<void> {
+  private async setupBuilderDevSidecars(
+    buildMatches: Iterable<BuildMatch>
+  ): Promise<void> {
     if (this.shouldUseServicesOrchestrator()) {
       return;
     }
@@ -251,7 +248,7 @@ export default class DevServer {
     // Sidecar topology is resolved once at startup, like configured services;
     // the individual service dev servers remain responsible for source reloads.
     const sidecars = await collectBuilderDevSidecars({
-      buildMatches: this.sidecarBuildMatches,
+      buildMatches,
       workPath: this.cwd,
     });
     if (sidecars.length === 0) {
@@ -259,15 +256,12 @@ export default class DevServer {
     }
     this.sidecars = sidecars;
 
-    const queueSidecars = sidecars
-      .filter(isExperimentalService)
-      .filter(isQueueBackedService);
-    if (queueSidecars.length > 0) {
-      this.injectDevQueueEnv();
-    }
+    Object.assign(this.envConfigs.runEnv, this.getDevQueueEnv());
+
+    const subscribers = sidecars.map(toOrchestratorSubscriber);
 
     const orchestrator = new ServicesOrchestrator({
-      services: sidecars,
+      services: subscribers,
       cwd: this.cwd,
       repoRoot: this.repoRoot,
       env: this.envConfigs.allEnv,
@@ -277,12 +271,9 @@ export default class DevServer {
     });
     this.sidecarOrchestrator = orchestrator;
 
-    const queueBroker =
-      queueSidecars.length > 0
-        ? new QueueBroker(queueSidecars, name =>
-            orchestrator.getServiceOrigin(name)
-          )
-        : undefined;
+    const queueBroker = new QueueBroker(subscribers, name =>
+      orchestrator.getServiceOrigin(name)
+    );
     this.queueBroker = queueBroker;
 
     try {
@@ -316,7 +307,6 @@ export default class DevServer {
     this.projectSettings = options.projectSettings;
     this.services = options.services;
     this.filteredSidecarBuilds = [];
-    this.sidecarBuildMatches = [];
     this.useImplicitServicesEnvInjection =
       options.useImplicitServicesEnvInjection ?? true;
     this.caseSensitive = false;
@@ -563,7 +553,7 @@ export default class DevServer {
   async updateBuildMatches(
     vercelConfig: VercelConfig,
     isInitial = false
-  ): Promise<void> {
+  ): Promise<BuildMatch[]> {
     const fileList = this.resolveBuildFiles(this.files);
     const matches = await getBuildMatches(
       vercelConfig,
@@ -572,7 +562,7 @@ export default class DevServer {
       fileList
     );
     const filteredMatches =
-      this.filteredSidecarBuilds.length > 0
+      isInitial && this.filteredSidecarBuilds.length > 0
         ? await getBuildMatches(
             {
               ...vercelConfig,
@@ -583,7 +573,6 @@ export default class DevServer {
             fileList
           )
         : [];
-    this.sidecarBuildMatches = [...matches, ...filteredMatches];
     const sources = matches.map(m => m.src);
 
     if (isInitial && fileList.length === 0) {
@@ -653,6 +642,8 @@ export default class DevServer {
         return sortBuilders(matchA[1] as Builder, matchB[1] as Builder);
       })
     );
+
+    return [...matches, ...filteredMatches];
   }
 
   async getLocalEnv(fileName: string, base?: Env): Promise<Env> {
@@ -925,7 +916,7 @@ export default class DevServer {
     }
 
     // Reapply queue configuration when a config refresh recreates runEnv.
-    if (this.hasQueueSidecars()) {
+    if (this.hasSubscribers()) {
       Object.assign(runEnv, this.getDevQueueEnv());
     }
 
@@ -1176,9 +1167,12 @@ export default class DevServer {
       }
     }
 
-    await this.updateBuildMatches(vercelConfig, true);
+    const sidecarBuildMatches = await this.updateBuildMatches(
+      vercelConfig,
+      true
+    );
 
-    await this.setupBuilderDevSidecars();
+    await this.setupBuilderDevSidecars(sidecarBuildMatches);
 
     if (!this.shouldUseServicesOrchestrator()) {
       devCommandPromise = this.runDevCommand();
@@ -1234,11 +1228,9 @@ export default class DevServer {
     this.server.on('upgrade', async (req, socket, head) => {
       await this.startPromise;
 
-      if (this.orchestrator || this.sidecarOrchestrator) {
+      if (this.orchestrator) {
         const pathname = url.parse(req.url || '/').pathname || '/';
-        const service =
-          this.orchestrator?.getServiceForRoute(pathname) ||
-          this.sidecarOrchestrator?.getServiceForRoute(pathname);
+        const service = this.orchestrator.getServiceForRoute(pathname);
         if (service) {
           const target = `http://${service.host}:${service.port}`;
           output.debug(
@@ -1247,13 +1239,11 @@ export default class DevServer {
           this.proxy.ws(req, socket, head, { target });
           return;
         }
-        if (this.orchestrator) {
-          output.debug(
-            `Detected "upgrade" event, but no matching service found for ${pathname}`
-          );
-          socket.destroy();
-          return;
-        }
+        output.debug(
+          `Detected "upgrade" event, but no matching service found for ${pathname}`
+        );
+        socket.destroy();
+        return;
       }
 
       if (this.devProcessOrigin) {
@@ -1558,7 +1548,7 @@ export default class DevServer {
   private getServiceRouteTable(serviceName: string): Route[] {
     if (!this.serviceRoutesTable) {
       this.serviceRoutesTable = new Map();
-      for (const service of [...(this.services || []), ...this.sidecars]) {
+      for (const service of this.services || []) {
         if (!isExperimentalServiceV2(service)) continue;
 
         const { routes, error } = getTransformedRoutes({
@@ -1592,9 +1582,7 @@ export default class DevServer {
     const { debug } = output;
     const { service: serviceName, path: destPath } = matchedRoute.destination;
 
-    const origin =
-      this.orchestrator?.getServiceOrigin(serviceName) ||
-      this.sidecarOrchestrator?.getServiceOrigin(serviceName);
+    const origin = this.orchestrator?.getServiceOrigin(serviceName);
     if (!origin) {
       output.error(
         `Cannot route to service ${cmd(serviceName)}: it is not running.`
@@ -1818,7 +1806,7 @@ export default class DevServer {
 
   /**
    * Handle /_svc/_queues/* routes for the dev queue broker, which mimics
-   * the Vercel Queues v3 API so workers can be used in vc dev unchanged.
+   * the Vercel Queues v3 API so subscribers can be used in vc dev unchanged.
    */
   private handleQueuesRoute = async (
     req: http.IncomingMessage,
@@ -2079,11 +2067,9 @@ export default class DevServer {
     }
 
     // With multi-service setup, try to route to the appropriate service first
-    if (callLevel === 0 && (this.orchestrator || this.sidecarOrchestrator)) {
+    if (callLevel === 0 && this.orchestrator) {
       const pathname = parsed.pathname || '/';
-      const service =
-        this.orchestrator?.getServiceForRoute(pathname) ||
-        this.sidecarOrchestrator?.getServiceForRoute(pathname);
+      const service = this.orchestrator.getServiceForRoute(pathname);
       if (service) {
         debug(`Found service: ${service.name}`);
         const upstream = `http://${service.host}:${service.port}`;
@@ -2339,7 +2325,7 @@ export default class DevServer {
 
       if (
         callLevel === 0 &&
-        (this.orchestrator || this.sidecarOrchestrator) &&
+        this.orchestrator &&
         !routeResult.continue &&
         isServiceDestination(routeResult.matched_route)
       ) {
@@ -2998,7 +2984,7 @@ export default class DevServer {
       },
       process.env,
       this.envConfigs.allEnv,
-      this.hasQueueSidecars() ? this.getDevQueueEnv() : undefined,
+      this.hasSubscribers() ? this.getDevQueueEnv() : undefined,
       {
         PORT: `${port}`,
       }

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { Builder, DevSidecar } from '@vercel/build-utils';
+import type { Builder, DevSubscriber } from '@vercel/build-utils';
 import type { BuilderWithPkg } from '../../../../src/util/build/import-builders';
 import { collectBuilderDevSidecars } from '../../../../src/util/dev/dev-sidecars';
 import type { BuildMatch } from '../../../../src/util/dev/types';
@@ -10,17 +10,15 @@ const build: Builder = {
   config: { framework: 'example' },
 };
 
-const sidecar: DevSidecar = {
-  schema: 'experimentalServices',
-  name: 'background-worker',
-  type: 'worker',
-  trigger: 'queue',
+const sidecar: DevSubscriber = {
+  name: 'background-subscriber',
+  type: 'subscriber',
   consumer: 'background-consumer',
   workspace: '.',
   runtime: 'example',
   builder: {
     use: build.use,
-    src: 'worker.ts',
+    src: 'subscriber.ts',
   },
   topics: [{ topic: 'jobs' }],
 };
@@ -109,20 +107,24 @@ describe('collectBuilderDevSidecars', () => {
         workPath: '/project',
       })
     ).rejects.toThrow(
-      'Multiple builders contributed a development sidecar named "background-worker"'
+      'Multiple builders contributed a development sidecar named "background-subscriber"'
     );
   });
 
-  it('does not invoke builders whose source patterns did not match', async () => {
-    const getDevSidecars = vi.fn().mockResolvedValue([sidecar]);
+  it('rejects unsupported sidecar types', async () => {
+    const getDevSidecars = vi
+      .fn()
+      .mockResolvedValue([{ ...sidecar, type: 'web' }]);
 
     await expect(
       collectBuilderDevSidecars({
-        buildMatches: [],
+        buildMatches: [
+          makeBuildMatch(makeBuilderWithPkg(build.use, getDevSidecars)),
+        ],
         workPath: '/project',
       })
-    ).resolves.toEqual([]);
-
-    expect(getDevSidecars).not.toHaveBeenCalled();
+    ).rejects.toThrow(
+      'Development sidecar "background-subscriber" must be a subscriber'
+    );
   });
 });
