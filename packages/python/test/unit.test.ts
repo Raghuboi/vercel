@@ -75,7 +75,12 @@ import {
 import { VERCEL_WORKERS_VERSION } from '../src/package-versions';
 import { createPyprojectToml } from '../src/install';
 import { getDjangoSettings, runDjangoCollectStatic } from '../src/django';
-import { FileBlob, Span, download } from '@vercel/build-utils';
+import {
+  FileBlob,
+  Span,
+  download,
+  sanitizeConsumerName,
+} from '@vercel/build-utils';
 import { getServiceCrons } from '../src/crons';
 import { entrypointToModule, detectPythonEntrypoint } from '../src/entrypoint';
 import execa from 'execa';
@@ -1364,6 +1369,45 @@ describe('fastapi entrypoint discovery - positive cases', () => {
     fs.removeSync(workPath);
   });
 
+  it('applies functions config to the resolved FastAPI entrypoint', async () => {
+    const workPath = path.join(
+      tmpdir(),
+      `python-fastapi-functions-config-${Date.now()}`
+    );
+    fs.mkdirSync(workPath, { recursive: true });
+    makeMockPython('3.9');
+
+    const files = {
+      'app/main.py': new FileBlob({
+        data: 'from fastapi import FastAPI\napp = FastAPI()\n',
+      }),
+    } as Record<string, FileBlob>;
+    await download(files, workPath);
+
+    const result = await build({
+      workPath,
+      files,
+      entrypoint: '<detect>',
+      meta: { isDev: true },
+      config: {
+        framework: 'fastapi',
+        functions: {
+          'app/main.py': {
+            memory: 512,
+            maxDuration: 30,
+          },
+        },
+      },
+      repoRootPath: workPath,
+    });
+
+    const lambda = getBuildOutputV2Lambda(result) as any;
+    expect(lambda.memory).toBe(512);
+    expect(lambda.maxDuration).toBe(30);
+
+    fs.removeSync(workPath);
+  });
+
   it('discovers src/index.py containing FastAPI', async () => {
     const workPath = path.join(
       tmpdir(),
@@ -2252,6 +2296,135 @@ describe('handlerFunction validation', () => {
   });
 });
 
+describe('pyproject subscribers', () => {
+  let mockWorkPath: string;
+
+  beforeEach(() => {
+    mockWorkPath = path.join(tmpdir(), `python-subscribers-${Date.now()}`);
+    fs.mkdirSync(mockWorkPath, { recursive: true });
+    makeMockPython('3.11');
+  });
+
+  afterEach(() => {
+    if (fs.existsSync(mockWorkPath)) {
+      fs.removeSync(mockWorkPath);
+    }
+  });
+
+  it('emits one queue/v2beta worker lambda per subscriber with all topics attached', async () => {
+    const files = {
+      'app.py': new FileBlob({
+        data: 'def app(environ, start_response): pass\n',
+      }),
+      'worker.py': new FileBlob({
+        data: 'from celery import Celery\napp = Celery("worker")\n',
+      }),
+      'pyproject.toml': new FileBlob({
+        data: [
+          '[project]',
+          'name = "x"',
+          'version = "0.0.1"',
+          '',
+          '[tool.vercel.subscribers.celery-worker]',
+          'entrypoint = "worker:app"',
+          'topics = ["celery", "emails"]',
+          'max_deliveries = 3',
+          'retry_after_seconds = 10',
+          'initial_delay_seconds = 0',
+          'max_concurrency = 5',
+          '',
+        ].join('\n'),
+      }),
+    } as Record<string, FileBlob>;
+
+    const result = await build({
+      workPath: mockWorkPath,
+      files,
+      entrypoint: 'app.py',
+      meta: { isDev: false },
+      config: { framework: 'flask' },
+      repoRootPath: mockWorkPath,
+    });
+
+    const output = getBuildOutputV2(result).output as any;
+    const celeryPath = '_py_subscribers/celery-worker';
+    const consumer = sanitizeConsumerName(celeryPath);
+
+    expect(output.index).toBeDefined();
+    expect(output[celeryPath]).toBeDefined();
+    expect(output['_py_subscribers/celery-worker/celery']).toBeUndefined();
+    expect(output['_py_subscribers/celery-worker/emails']).toBeUndefined();
+    expect(output.index.environment.VERCEL_HAS_WORKER_SERVICES).toBe('1');
+
+    const celery = output[celeryPath];
+    expect(celery.handler).toBe('vc__handler__python.vc_handler');
+    expect(celery.environment.VERCEL_SERVICE_TYPE).toBe('worker');
+    expect(celery.experimentalTriggers).toEqual([
+      {
+        type: 'queue/v2beta',
+        topic: 'celery',
+        consumer,
+        maxDeliveries: 3,
+        retryAfterSeconds: 10,
+        initialDelaySeconds: 0,
+        maxConcurrency: 5,
+      },
+      {
+        type: 'queue/v2beta',
+        topic: 'emails',
+        consumer,
+        maxDeliveries: 3,
+        retryAfterSeconds: 10,
+        initialDelaySeconds: 0,
+        maxConcurrency: 5,
+      },
+    ]);
+
+    const handler = celery.files?.['vc__handler__python.py'];
+    if (!handler || !('data' in handler)) {
+      throw new Error('subscriber handler bootstrap not found');
+    }
+    expect(handler.data.toString()).toContain(
+      '"__VC_HANDLER_VARIABLE_NAME": "app"'
+    );
+  });
+
+  it('rejects consumer because subscriber consumers are derived from function paths', async () => {
+    const files = {
+      'app.py': new FileBlob({
+        data: 'def app(environ, start_response): pass\n',
+      }),
+      'worker.py': new FileBlob({
+        data: 'app = object()\n',
+      }),
+      'pyproject.toml': new FileBlob({
+        data: [
+          '[project]',
+          'name = "x"',
+          'version = "0.0.1"',
+          '',
+          '[tool.vercel.subscribers.worker]',
+          'entrypoint = "worker:app"',
+          'topics = ["jobs"]',
+          'consumer = "custom"',
+          '',
+        ].join('\n'),
+      }),
+    } as Record<string, FileBlob>;
+
+    await expect(
+      build({
+        workPath: mockWorkPath,
+        files,
+        entrypoint: 'app.py',
+        meta: { isDev: false },
+        config: { framework: 'flask' },
+        repoRootPath: mockWorkPath,
+      })
+    ).rejects.toThrow(/unrecognized field "consumer"/);
+  });
+});
+
 describe('cron service build result', () => {
   let mockWorkPath: string;
 
@@ -2578,7 +2751,7 @@ describe('dynamic cron detection', () => {
   });
 });
 
-describe('non-web services should not generate catch-all routes', () => {
+describe('non-web V1 services should not generate catch-all routes', () => {
   let mockWorkPath: string;
 
   beforeEach(() => {
@@ -2665,14 +2838,30 @@ describe('non-web services should not generate catch-all routes', () => {
     expect(v2result.output['_svc/my-worker/index']).toBeDefined();
     expect(v2result.routes).toBeUndefined();
   });
+});
 
-  it('web service returns V2 with no routes', async () => {
+describe('V2 services should generate catch-all routes', () => {
+  let mockWorkPath: string;
+
+  beforeEach(() => {
+    mockWorkPath = path.join(tmpdir(), `python-service-routes-${Date.now()}`);
+    fs.mkdirSync(mockWorkPath, { recursive: true });
+    makeMockPython('3.11');
+  });
+
+  afterEach(() => {
+    if (fs.existsSync(mockWorkPath)) {
+      fs.removeSync(mockWorkPath);
+    }
+  });
+
+  it('V2 service returns catch-all routes', async () => {
     const files = {
       'main.py': new FileBlob({
         data: 'from fastapi import FastAPI; app = FastAPI()',
       }),
       'pyproject.toml': new FileBlob({
-        data: '[project]\nname = "my-api"\nversion = "0.0.1"\ndependencies = ["fastapi"]\n',
+        data: '[project]\nname = "my-backend"\nversion = "0.0.1"\ndependencies = ["fastapi"]\n',
       }),
     } as Record<string, FileBlob>;
     await download(files, mockWorkPath);
@@ -2684,12 +2873,16 @@ describe('non-web services should not generate catch-all routes', () => {
       meta: { isDev: false },
       config: { framework: 'fastapi' },
       repoRootPath: mockWorkPath,
-      service: { type: 'web', name: 'my-api' },
+      service: { name: 'my-backend' },
     });
 
     const v2result = getBuildOutputV2(result);
-    expect(v2result.output['_svc/my-api/index']).toBeDefined();
-    expect(v2result.routes).toBeUndefined();
+    expect(v2result.output.index).toBeDefined();
+    expect(v2result.output['_svc/my-backend/index']).toBeUndefined();
+    expect(v2result.routes).toEqual([
+      { handle: 'filesystem' },
+      { src: '/(.*)', dest: '/index' },
+    ]);
   });
 });
 
