@@ -1,4 +1,6 @@
 import { homedir } from 'node:os';
+import { existsSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
 import chalk from 'chalk';
 import type Client from '../../util/client';
 import output from '../../output-manager';
@@ -17,6 +19,7 @@ import {
   VALID_EXPIRY_VALUES,
 } from '../../util/ai-gateway/expiry';
 import { resolveAgents } from '../../util/ai-gateway/coding-agents/resolve';
+import { getAgentById } from '../../util/ai-gateway/coding-agents/agents';
 import {
   ensureTeam,
   createKey,
@@ -30,6 +33,8 @@ import {
   applyPlan,
 } from '../../util/ai-gateway/coding-agents/apply';
 import {
+  printResolvedState,
+  printPlan,
   printNotes,
   printKey,
 } from '../../util/ai-gateway/coding-agents/render';
@@ -70,6 +75,10 @@ export default async function codingAgentsConnect(
   const expiration = opts['--expiration'] as string | undefined;
   const name = opts['--name'] as string | undefined;
   const reconfigure = opts['--reconfigure'] as boolean | undefined;
+  const dryRun = opts['--dry-run'] as boolean | undefined;
+  const noBackup = opts['--no-backup'] as boolean | undefined;
+  const agentConfig = opts['--agent-config'] as string[] | undefined;
+  const shellRcOverride = opts['--shell-rc'] as string | undefined;
   const yes = opts['--yes'] as boolean | undefined;
 
   telemetry.trackCliOptionAgent(agentFlags as [string] | undefined);
@@ -81,6 +90,10 @@ export default async function codingAgentsConnect(
   telemetry.trackCliOptionExpiration(expiration);
   telemetry.trackCliOptionName(name);
   telemetry.trackCliFlagReconfigure(reconfigure);
+  telemetry.trackCliFlagDryRun(dryRun);
+  telemetry.trackCliFlagNoBackup(noBackup);
+  telemetry.trackCliOptionAgentConfig(agentConfig);
+  telemetry.trackCliOptionShellRc(shellRcOverride);
   telemetry.trackCliFlagYes(yes);
 
   const machine = shouldEmitNonInteractiveCommandError(client);
@@ -116,6 +129,36 @@ export default async function codingAgentsConnect(
       ? presetToExpiresAt(expiration)
       : undefined;
 
+  const overrides: Record<string, string> = {};
+  for (const pair of agentConfig ?? []) {
+    const eq = pair.indexOf('=');
+    const id = eq > 0 ? pair.slice(0, eq).trim().toLowerCase() : '';
+    const path = eq > 0 ? pair.slice(eq + 1).trim() : '';
+    if (!id || !path) {
+      return failValidation(
+        client,
+        machine,
+        AGENT_REASON.INVALID_ARGUMENTS,
+        `Invalid --agent-config "${pair}". Use <agent>=<path>, e.g. claude-code=/path/settings.json.`
+      );
+    }
+    if (!getAgentById(id)) {
+      return failValidation(
+        client,
+        machine,
+        AGENT_REASON.INVALID_ARGUMENTS,
+        `Unknown agent "${id}" in --agent-config.`
+      );
+    }
+    overrides[id] = resolve(path);
+  }
+
+  if (dryRun && !machine) {
+    output.log(
+      `${chalk.bold('Dry run')} — previewing changes only. No files will be written and no API key will be created.`
+    );
+  }
+
   const selection = await resolveAgents({
     client,
     agentFlags,
@@ -140,13 +183,23 @@ export default async function codingAgentsConnect(
     output.warn(note);
   }
 
-  // With no --key we create one. Collect its name, team, quota, and expiry.
+  for (const id of Object.keys(overrides)) {
+    if (!selected.some(a => a.id === id)) {
+      return failValidation(
+        client,
+        machine,
+        AGENT_REASON.INVALID_ARGUMENTS,
+        `--agent-config set for "${id}", which isn't selected. Add --agent ${id} (or --all).`
+      );
+    }
+  }
+
   const willCreate = !providedKey;
   let keyName = name;
   let keyBudget = budget;
   let keyRefresh = refreshPeriod;
   let keyExpiresAt = flagExpiresAt;
-  if (willCreate) {
+  if (willCreate && (!dryRun || canPrompt)) {
     const promptCreate = canPrompt && !yes;
 
     if (promptCreate && keyName === undefined) {
@@ -173,35 +226,69 @@ export default async function codingAgentsConnect(
       }
     }
   }
-
+  if (canPrompt && !yes) {
+    const missing = selected.filter(
+      a =>
+        !overrides[a.id] &&
+        !existsSync(dirname(a.configPath({ apiKey: '', home })))
+    );
+    if (missing.length > 0) {
+      const customize = await client.input.confirm(
+        "Some agents weren't found at their default locations. Set custom config paths?",
+        false
+      );
+      if (customize) {
+        for (const agent of missing) {
+          const resolved = agent.configPath({
+            apiKey: '',
+            home,
+          });
+          const answer = await client.input.text({
+            message: `${agent.displayName} config path`,
+            default: resolved,
+          });
+          const picked = answer.trim();
+          if (picked && resolve(picked) !== resolved) {
+            overrides[agent.id] = resolve(picked);
+          }
+        }
+      }
+    }
+  }
   const previewKey = providedKey ?? KEY_PLACEHOLDER;
+
   const previewPlan = await buildSetupPlan(selected, {
     apiKey: previewKey,
     home,
+    overrides,
+    shellRcOverride,
   });
+
   const changed = previewPlan.changes.filter(
     c => c.status === 'create' || c.status === 'update'
   );
   const errored = previewPlan.changes.filter(c => c.status === 'error');
   const alreadyConfigured = changed.length === 0 && errored.length === 0;
 
-  const mintKey = () =>
-    createKey(client, {
-      name: keyName,
-      budget: keyBudget,
-      refreshPeriod: keyRefresh,
-      includeByok,
-      expiresAt: keyExpiresAt,
-    });
-
   if (machine) {
     return runMachine({
       client,
       selected,
       unsupported,
+      previewPlan,
+      dryRun: Boolean(dryRun),
+      backup: !noBackup,
       keySource: providedKey ? { key: providedKey, created: false } : null,
-      createKey: mintKey,
-      backup: true,
+      createKey: () =>
+        createKey(client, {
+          name: keyName,
+          budget: keyBudget,
+          refreshPeriod: keyRefresh,
+          includeByok,
+          expiresAt: keyExpiresAt,
+        }),
+      overrides,
+      shellRcOverride,
       home,
       alreadyConfigured,
       reconfigure: Boolean(reconfigure),
@@ -230,11 +317,45 @@ export default async function codingAgentsConnect(
     }
   }
 
+  printPlan(previewPlan, previewKey, { backup: !noBackup });
+  printResolvedState({
+    selected,
+    willCreate,
+    name: keyName,
+    budget: keyBudget,
+    refreshPeriod: keyRefresh,
+    expiresAt: keyExpiresAt,
+  });
+
+  if (dryRun) {
+    output.log(
+      `Dry run — no files written. Re-run without ${chalk.bold('--dry-run')} to apply.`
+    );
+    return 0;
+  }
+
+  if (changed.length > 0 && canPrompt && !yes) {
+    const confirmed = await client.input.confirm('Apply these changes?', true);
+    if (!confirmed) {
+      output.log('Aborted. No files were changed.');
+      return 0;
+    }
+  }
+
   let keySource: KeySource;
   try {
     keySource = providedKey
       ? { key: providedKey, created: false }
-      : { key: await mintKey(), created: true };
+      : {
+          key: await createKey(client, {
+            name: keyName,
+            budget: keyBudget,
+            refreshPeriod: keyRefresh,
+            includeByok,
+            expiresAt: keyExpiresAt,
+          }),
+          created: true,
+        };
   } catch (err) {
     output.stopSpinner();
     if (isAPIError(err)) {
@@ -244,8 +365,14 @@ export default async function codingAgentsConnect(
     throw err;
   }
 
-  const plan = await buildSetupPlan(selected, { apiKey: keySource.key, home });
-  const results = await applyPlan(plan, { backup: true });
+  const applyPlanResult = await buildSetupPlan(selected, {
+    apiKey: keySource.key,
+    home,
+    overrides,
+    shellRcOverride,
+  });
+
+  const results = await applyPlan(applyPlanResult, { backup: !noBackup });
 
   output.print('\n');
   if (results.length === 0 && keySource.created) {
@@ -269,7 +396,7 @@ export default async function codingAgentsConnect(
     output.log(chalk.dim('Previous files saved alongside as .bak'));
   }
 
-  printNotes(plan);
+  printNotes(applyPlanResult);
   printKey(keySource.key);
   return 0;
 }
