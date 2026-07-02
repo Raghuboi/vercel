@@ -4,6 +4,12 @@ export interface SetupContext {
   useKeychain?: boolean;
   overrides?: Record<string, string>;
   shellRcOverride?: string;
+  /**
+   * Agents that were selected but not consented to (declined or skipped).
+   * Their existing exports in the managed shell block must survive a rewrite —
+   * dropping them would break a previously connected agent's setup.
+   */
+  preserveEnvOf?: CodingAgent[];
 }
 
 export type FileFormat = 'json' | 'toml' | 'shell';
@@ -27,6 +33,27 @@ export interface AgentPlan {
   notes: string[];
 }
 
+/**
+ * Context available before a key exists or any setup question has been asked —
+ * warnings run first so the user can bail before the key interview.
+ */
+export interface WarningContext {
+  home: string;
+}
+
+export interface AgentWarning {
+  /** Stable machine-readable id for JSON payloads, e.g. 'desktop_app_breaks'. */
+  code: string;
+  /** What the user loses by consenting — the headline, e.g. 'The Codex desktop app will stop working.' */
+  impact: string;
+  /** Why connecting causes that impact. Full sentence(s). */
+  why: string;
+  /** How to revert after connecting, phrased to follow 'To undo,'. No trailing period. */
+  undo: string;
+  /** The consent question, e.g. 'Configure Codex anyway?'. */
+  confirm: string;
+}
+
 export interface CodingAgent {
   id: string;
   displayName: string;
@@ -35,4 +62,6 @@ export interface CodingAgent {
   /** Resolved config-file path: override > native env var > home default. */
   configPath(ctx: SetupContext): string;
   buildPlan(ctx: SetupContext): AgentPlan;
+  /** Pre-flight warnings that need explicit consent before configuring. */
+  warnings?(ctx: WarningContext): Promise<AgentWarning[]>;
 }

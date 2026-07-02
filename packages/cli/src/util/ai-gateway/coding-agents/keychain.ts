@@ -42,3 +42,22 @@ export function keychainLookup(opts: { fish?: boolean } = {}): string {
   const cmd = `${SECURITY_BIN} find-generic-password -s '${KEYCHAIN_SERVICE}' -a '${KEYCHAIN_ACCOUNT}' -w 2>/dev/null`;
   return opts.fish ? `(${cmd})` : `$(${cmd})`;
 }
+
+/**
+ * True when the login keychain has a generic-password item for `service`.
+ * Queries item metadata only (no `-w`), so the secret itself is never read
+ * and no per-item ACL prompt is triggered. Always `false` off macOS.
+ */
+export function keychainHasGenericPassword(service: string): boolean {
+  if (!isKeychainAvailable()) {
+    return false;
+  }
+  try {
+    execFileSync(SECURITY_BIN, ['find-generic-password', '-s', service], {
+      stdio: 'ignore',
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}

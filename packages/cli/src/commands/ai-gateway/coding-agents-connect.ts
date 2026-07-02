@@ -39,6 +39,13 @@ import {
   printNotes,
   printKey,
 } from '../../util/ai-gateway/coding-agents/render';
+import {
+  collectAgentWarnings,
+  formatWarningMessage,
+  groupWarningsByAgent,
+  printAgentWarning,
+  promptAgentConsent,
+} from '../../util/ai-gateway/coding-agents/consent';
 import { runMachine } from '../../util/ai-gateway/coding-agents/machine';
 import { KEY_PLACEHOLDER } from '../../util/ai-gateway/coding-agents/gateway';
 import {
@@ -49,6 +56,8 @@ import {
   outputAgentError,
   shouldEmitNonInteractiveCommandError,
 } from '../../util/agent-output';
+import { packageName } from '../../util/pkg-name';
+import { stripSensitiveAuthArgs } from '../../util/redact-args';
 import { AGENT_STATUS, AGENT_REASON } from '../../util/agent-output-constants';
 import { connectSubcommand } from './command';
 import { AiGatewayCodingAgentsConnectTelemetryClient } from '../../util/telemetry/commands/ai-gateway/coding-agents-connect';
@@ -202,12 +211,93 @@ export default async function codingAgentsConnect(
     }
   }
 
+  // Consent comes first: a user who declines must be able to bail before the
+  // key interview asks a single question or ensureTeam touches the network.
+  let agents = selected;
+  const agentWarnings = await collectAgentWarnings(selected, { home });
+  const machineWarnings = agentWarnings.map(e => ({
+    agent: e.agent.id,
+    code: e.warning.code,
+    message: formatWarningMessage(e.warning),
+  }));
+  const consentSkipped: Array<{
+    target: string;
+    reason: string;
+    message: string;
+  }> = [];
+  const previewKey = providedKey ?? KEY_PLACEHOLDER;
+  // Set when every selected agent was consent-skipped: whether the existing
+  // setup already matches what a consented run would write.
+  let allSkippedConfigured = false;
+  if (agentWarnings.length > 0) {
+    const explicit = Boolean((agentFlags && agentFlags.length > 0) || all);
+    if (canPrompt && !yes && !dryRun) {
+      const declined = await promptAgentConsent(client, agentWarnings);
+      if (declined.size > 0) {
+        agents = agents.filter(a => !declined.has(a.id));
+        for (const agent of selected) {
+          if (declined.has(agent.id)) {
+            output.log(
+              `Skipped ${agent.displayName} — its configuration was left untouched.`
+            );
+          }
+        }
+        if (agents.length === 0) {
+          output.log('Nothing to configure. No files were changed.');
+          return 0;
+        }
+      }
+    } else if (explicit || (canPrompt && !yes && dryRun)) {
+      for (const { warning } of agentWarnings) {
+        printAgentWarning(warning);
+      }
+      // No confirm follows here; keep the block separated from what's next.
+      output.print('\n');
+    } else {
+      for (const [agent, warnings] of groupWarningsByAgent(agentWarnings)) {
+        const message = `${warnings.map(formatWarningMessage).join(' ')} Pass --agent ${agent.id} to configure it anyway.`;
+        consentSkipped.push({
+          target: agent.id,
+          reason: AGENT_REASON.REQUIRES_CONSENT,
+          message,
+        });
+        output.warn(message);
+      }
+      agents = agents.filter(a => !consentSkipped.some(s => s.target === a.id));
+      if (agents.length === 0) {
+        // Everything was consent-skipped. A fully-configured setup is still a
+        // successful no-op (automation re-runs must not start failing once a
+        // login appears), so probe with the preview key before failing: on
+        // Keychain and env-only setups the key never lands in the files, so
+        // even a no-key re-run proves 'unchanged', while a setup this run
+        // would rewrite shows 'create'/'update'. The keychain prompt never
+        // runs on this branch, so wantKeychain is the resolved value.
+        const probePlan = await buildSetupPlan(selected, {
+          apiKey: previewKey,
+          home,
+          useKeychain: wantKeychain,
+          overrides,
+          shellRcOverride,
+        });
+        allSkippedConfigured = probePlan.changes.every(
+          c => c.status === 'unchanged'
+        );
+        if (!dryRun && !allSkippedConfigured) {
+          return failConsent(client, machine, machineWarnings, consentSkipped);
+        }
+      }
+    }
+  }
+  const skippedAgents = selected.filter(a => !agents.includes(a));
+
   const willCreate = !providedKey;
   let keyName = name;
   let keyBudget = budget;
   let keyRefresh = refreshPeriod;
   let keyExpiresAt = flagExpiresAt;
-  if (willCreate && (!dryRun || canPrompt)) {
+  // With every agent consent-skipped the run can only end as a no-op, so the
+  // key interview (and its team/scope requirement) has nothing to set up.
+  if (willCreate && agents.length > 0 && (!dryRun || canPrompt)) {
     const promptCreate = canPrompt && !yes;
 
     if (promptCreate && keyName === undefined) {
@@ -240,7 +330,7 @@ export default async function codingAgentsConnect(
   }
 
   if (canPrompt && !yes) {
-    const missing = selected.filter(
+    const missing = agents.filter(
       a =>
         !overrides[a.id] &&
         !existsSync(dirname(a.configPath({ apiKey: '', home })))
@@ -268,14 +358,13 @@ export default async function codingAgentsConnect(
       }
     }
   }
-  const previewKey = providedKey ?? KEY_PLACEHOLDER;
-
-  const previewPlan = await buildSetupPlan(selected, {
+  const previewPlan = await buildSetupPlan(agents, {
     apiKey: previewKey,
     home,
     useKeychain,
     overrides,
     shellRcOverride,
+    preserveEnvOf: skippedAgents,
   });
 
   const changed = previewPlan.changes.filter(
@@ -287,8 +376,11 @@ export default async function codingAgentsConnect(
   if (machine) {
     return runMachine({
       client,
-      selected,
+      selected: agents,
       unsupported,
+      warnings: machineWarnings,
+      consentSkipped,
+      preserveEnvOf: skippedAgents,
       previewPlan,
       dryRun: Boolean(dryRun),
       backup: !noBackup,
@@ -306,13 +398,30 @@ export default async function codingAgentsConnect(
       shellRcOverride,
       home,
       alreadyConfigured,
-      reconfigure: Boolean(reconfigure),
+      // With nothing consented there is nothing to rotate or reconfigure.
+      reconfigure: Boolean(reconfigure) && agents.length > 0,
     });
   }
 
   // Already wired up: instead of a dead-end no-op, offer to rotate the key or
   // reconfigure (e.g. a rotated/expired key, or a different team).
   if (alreadyConfigured) {
+    const skippedSome = agents.length < selected.length;
+    // Every selected agent was consent-skipped during a dry run: the plan is
+    // empty because nothing was inspected, not because everything is set up.
+    // Predict the real run's outcome from the probe instead.
+    if (dryRun && agents.length === 0 && consentSkipped.length > 0) {
+      output.log(
+        allSkippedConfigured
+          ? providedKey && useKeychain
+            ? 'All selected agents need explicit consent (see the warnings above), but their existing configuration already uses the AI Gateway — a real run would only update the macOS Keychain with the provided key.'
+            : 'All selected agents need explicit consent (see the warnings above), but their existing configuration already uses the AI Gateway — a real run would make no changes.'
+          : `All selected agents need explicit consent (see the warnings above) — a real run would fail. Pass ${consentSkipped
+              .map(s => `--agent ${s.target}`)
+              .join(' ')} (or --all) to consent. No files would be changed.`
+      );
+      return 0;
+    }
     // A provided key on a Keychain setup: refresh the stored secret in place,
     // even though the config files themselves don't change.
     if (!dryRun && useKeychain && providedKey) {
@@ -321,14 +430,17 @@ export default async function codingAgentsConnect(
         return 1;
       }
       output.log(
-        'All selected agents are already configured; updated the macOS Keychain with the provided key.'
+        agents.length === 0
+          ? 'The existing configuration already uses the AI Gateway; updated the macOS Keychain with the provided key.'
+          : `${skippedSome ? 'The remaining' : 'All selected'} agents are already configured; updated the macOS Keychain with the provided key.`
       );
       printKey(providedKey, { keychain: true });
       return 0;
     }
     // Otherwise offer to rotate/reconfigure. `--reconfigure` skips the prompt.
-    let doReconfigure = Boolean(reconfigure);
-    if (!doReconfigure && canPrompt && !yes && !dryRun) {
+    // With nothing consented there is nothing to rotate or reconfigure.
+    let doReconfigure = Boolean(reconfigure) && agents.length > 0;
+    if (!doReconfigure && agents.length > 0 && canPrompt && !yes && !dryRun) {
       doReconfigure = await client.input.confirm(
         'These agents are already configured for the AI Gateway. Reconfigure them?',
         false
@@ -336,7 +448,9 @@ export default async function codingAgentsConnect(
     }
     if (!doReconfigure) {
       output.log(
-        'All selected agents are already configured for the AI Gateway.'
+        agents.length === 0
+          ? 'Every selected agent needs explicit consent (see the warnings above); the existing configuration already uses the AI Gateway.'
+          : `${skippedSome ? 'The remaining' : 'All selected'} agents are already configured for the AI Gateway.`
       );
       if (providedKey) {
         printKey(providedKey);
@@ -348,7 +462,7 @@ export default async function codingAgentsConnect(
 
   printPlan(previewPlan, previewKey, { backup: !noBackup });
   printResolvedState({
-    selected,
+    selected: agents,
     willCreate,
     name: keyName,
     budget: keyBudget,
@@ -412,12 +526,13 @@ export default async function codingAgentsConnect(
     useKeychain = false;
   }
 
-  const applyPlanResult = await buildSetupPlan(selected, {
+  const applyPlanResult = await buildSetupPlan(agents, {
     apiKey: keySource.key,
     home,
     useKeychain,
     overrides,
     shellRcOverride,
+    preserveEnvOf: skippedAgents,
   });
 
   const results = await applyPlan(applyPlanResult, { backup: !noBackup });
@@ -457,6 +572,67 @@ export default async function codingAgentsConnect(
     client.stdout.write(`${keySource.key}\n`);
   }
   return 0;
+}
+
+/**
+ * The original invocation with the consent flags appended, so following it
+ * repeats the SAME run (same key intent, budget, expiry, config paths…) plus
+ * consent — not a materially different mutation. The `--key` value is
+ * redacted: suggested commands must never carry key material.
+ */
+function buildConsentCommand(argv: string[], consentFlags: string): string {
+  const args = stripSensitiveAuthArgs(argv.slice(2));
+  const redacted: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--key') {
+      redacted.push(arg, '<key>');
+      if (i + 1 < args.length && !args[i + 1].startsWith('-')) i++;
+      continue;
+    }
+    if (arg.startsWith('--key=')) {
+      redacted.push('--key=<key>');
+      continue;
+    }
+    redacted.push(arg);
+  }
+  return `${packageName} ${redacted.join(' ')} ${consentFlags}`.trim();
+}
+
+/**
+ * Every selected agent needs consent the run doesn't have. The JSON payload
+ * must be self-contained: the human warnings went to stderr, so the structured
+ * warnings, the skip entries, and a runnable consent command travel with it.
+ * `--yes` cannot grant consent, hence a reason distinct from
+ * `confirmation_required` (which agents fix by re-running with --yes).
+ */
+function failConsent(
+  client: Client,
+  machine: boolean,
+  warnings: Array<{ agent: string; code: string; message: string }>,
+  skipped: Array<{ target: string; reason: string; message: string }>
+): number {
+  const consentFlags = skipped.map(s => `--agent ${s.target}`).join(' ');
+  const message = `All selected agents need explicit consent to configure. Pass ${consentFlags} (or --all) to consent, or run interactively without --yes.`;
+  if (machine) {
+    client.stdout.write(
+      `${JSON.stringify(
+        {
+          status: AGENT_STATUS.ERROR,
+          reason: AGENT_REASON.REQUIRES_CONSENT,
+          message,
+          warnings,
+          skipped,
+          next: [{ command: buildConsentCommand(client.argv, consentFlags) }],
+        },
+        null,
+        2
+      )}\n`
+    );
+  } else {
+    output.error(message);
+  }
+  return 1;
 }
 
 function failValidation(

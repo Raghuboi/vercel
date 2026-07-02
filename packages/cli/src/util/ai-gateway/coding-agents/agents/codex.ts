@@ -1,7 +1,12 @@
 import { join } from 'node:path';
-import type { CodingAgent } from '../types';
+import type { AgentWarning, CodingAgent } from '../types';
 import { mergeToml, pathExists } from '../config-files';
+import { isMacAppInstalled } from '../desktop-apps';
+import { hasCodexLogin } from '../logins';
 import { GATEWAY_OPENAI_BASE_URL, GATEWAY_API_KEY_ENV } from '../gateway';
+
+/** The Codex desktop app shares `~/.codex/config.toml` with the CLI. */
+const CODEX_DESKTOP_APP = 'Codex.app';
 
 /**
  * Codex reads `~/.codex/config.toml`. We add a `vercel` model provider pointing
@@ -27,6 +32,29 @@ export const codex: CodingAgent = {
 
   async detect(home) {
     return pathExists(codexDir(home));
+  },
+
+  async warnings({ home }) {
+    const warnings: AgentWarning[] = [];
+    if (isMacAppInstalled(CODEX_DESKTOP_APP, home)) {
+      warnings.push({
+        code: 'desktop_app_breaks',
+        impact: 'The Codex desktop app will stop working.',
+        why: 'The desktop app is installed and cannot use custom model providers, and connecting sets model_provider = "vercel" in the config.toml the app shares with the CLI. The Codex CLI keeps working.',
+        undo: 'remove the model_provider line from config.toml',
+        confirm: 'Configure Codex anyway?',
+      });
+    }
+    if (hasCodexLogin(codexDir(home))) {
+      warnings.push({
+        code: 'openai_login_conflict',
+        impact: 'Your ChatGPT or OpenAI login will stop being used or billed.',
+        why: 'Codex is signed in with a ChatGPT or OpenAI account, and connecting makes the gateway the default model provider; the login itself stays in place.',
+        undo: 'remove the model_provider line from config.toml',
+        confirm: 'Configure Codex anyway?',
+      });
+    }
+    return warnings;
   },
 
   configPath(ctx) {
