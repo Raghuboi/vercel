@@ -364,6 +364,16 @@ export default async function codingAgentsConnect(
     return 0;
   }
 
+  // A shell-rc export alone doesn't count: without its agent config written,
+  // the exported key would serve nothing.
+  const agentConfigChanged = changed.filter(c => c.format !== 'shell');
+  if (agentConfigChanged.length === 0 && errored.length > 0) {
+    output.error(
+      'No agent configurations could be written. Fix the files above, then re-run.'
+    );
+    return 1;
+  }
+
   if (changed.length > 0 && canPrompt && !yes) {
     const confirmed = await client.input.confirm('Apply these changes?', true);
     if (!confirmed) {
@@ -436,6 +446,16 @@ export default async function codingAgentsConnect(
 
   printNotes(applyPlanResult);
   printKey(keySource.key, { keychain: useKeychain });
+  if (
+    keySource.created &&
+    !useKeychain &&
+    applyPlanResult.envExports.length > 0 &&
+    !applyPlanResult.shellRcPath
+  ) {
+    // No config file or shell rc carries the new key (e.g. Windows), so print
+    // it once — otherwise it would be unrecoverable.
+    client.stdout.write(`${keySource.key}\n`);
+  }
   return 0;
 }
 
