@@ -12,7 +12,7 @@ export interface DeployManifestService {
 }
 
 export interface DeployManifest {
-  manifestVersion: '2.0';
+  manifestVersion: '2.0' | '2.1';
   builds: Record<string, DeployManifestBuild>;
   services?: Record<string, DeployManifestService>;
 }

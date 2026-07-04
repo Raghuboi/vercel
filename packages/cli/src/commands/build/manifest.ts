@@ -91,7 +91,7 @@ export async function writeManifests(
 
   const deployManifestBlob = new FileBlob({
     data: JSON.stringify({
-      manifestVersion: '2.0',
+      manifestVersion: '2.1',
       builds: deployManifestBuilds,
       services: deployManifestServices,
     }),
